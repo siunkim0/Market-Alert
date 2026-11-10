@@ -74,6 +74,8 @@ export interface MarketData {
   watch(symbols: string[], onQuote: (q: Quote) => void, onError: (e: MarketDataError) => void): Promise<void>;
   /** 구독 목록 교체 */
   setSymbols(symbols: string[]): Promise<void>;
+  /** 구독하지 않은 종목의 현재 quote 1회 조회 */
+  quote(symbol: string): Promise<Quote>;
   dailyBars(symbol: string, count: number): Promise<Bar[]>;
   symbolInfo(symbol: string): Promise<SymbolMeta>;
   search(query: string): Promise<SymbolCandidate[]>;

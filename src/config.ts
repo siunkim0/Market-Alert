@@ -23,6 +23,10 @@ const EnvSchema = z.object({
       }
       return ids;
     }),
+  LLM_PROVIDER: z.enum(['groq']).default('groq'),
+  GROQ_API_KEY: optionalStr,
+  GROQ_MODEL_FAST: z.string().default('openai/gpt-oss-20b'),
+  GROQ_MODEL_SMART: z.string().default('openai/gpt-oss-120b'),
   ANTHROPIC_API_KEY: optionalStr,
   ANTHROPIC_MODEL_FAST: z.string().default('claude-haiku-5-5'),
   ANTHROPIC_MODEL_SMART: z.string().default('claude-sonnet-5-5'),

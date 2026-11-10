@@ -178,6 +178,13 @@ export class Repo {
     })();
   }
 
+  setAlertExplanation(ids: number[], explanation: string, sourcesJson: string): void {
+    const stmt = this.db.prepare('UPDATE alert_log SET explanation = ?, sources_json = ? WHERE id = ?');
+    this.db.transaction(() => {
+      for (const id of ids) stmt.run(explanation, sourcesJson, id);
+    })();
+  }
+
   /** cooldown 복원용: 최근 생성된 알림 */
   alertsSince(sinceIso: string): AlertLogRow[] {
     return this.db.prepare('SELECT * FROM alert_log WHERE created_at >= ? ORDER BY id').all(sinceIso) as AlertLogRow[];

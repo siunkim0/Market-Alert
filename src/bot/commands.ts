@@ -9,12 +9,25 @@ import type { MarketMonitor } from '../market/monitor.js';
 import type { SubscriptionManager } from '../market/subscriptions.js';
 import type { SymbolResolver } from '../market/symbols.js';
 import type { TriggerEngine } from '../triggers/engine.js';
+import type { Explainer } from '../agent/explain.js';
 import { fmtLevel } from '../triggers/engine.js';
 import { fmtKst } from '../time.js';
 import type { Choices } from './confirm.js';
-import { esc, fmtPct, fmtPrice, formatList, formatStatus, thresholdLabel } from './format.js';
+import { delayTag, esc, fmtPct, fmtPrice, fmtZ, formatExplanation, formatList, formatStatus, thresholdLabel } from './format.js';
 
 type ChoiceRun = (ctx: Context) => Promise<void>;
+
+/** 명령 실행 단위. 슬래시 명령과 자연어 의도(intents)가 같이 쓴다. */
+export interface Actions {
+  add(ctx: Context, args: AddArgs): Promise<void>;
+  remove(ctx: Context, query: string): Promise<void>;
+  list(ctx: Context): Promise<void>;
+  mode(ctx: Context, query: string, mode: WatchMode, threshold: number): Promise<void>;
+  level(ctx: Context, args: LevelArgs): Promise<void>;
+  /** ms=0이면 해제 */
+  mute(ctx: Context, query: string, ms: number): Promise<void>;
+  why(ctx: Context, query: string): Promise<void>;
+}
 
 export interface BotDeps {
   cfg: AppConfig;
@@ -26,6 +39,7 @@ export interface BotDeps {
   resolver: SymbolResolver;
   choices: Choices;
   engine: TriggerEngine;
+  explainer: Explainer;
   logger: Logger;
 }
 
@@ -38,6 +52,7 @@ export const COMMANDS: { command: string; description: string }[] = [
   { command: 'levels', description: '레벨 알림 목록' },
   { command: 'unlevel', description: '레벨 알림 삭제: /unlevel <id>' },
   { command: 'mute', description: '음소거: /mute <종목> <2h|30m|1d|off>' },
+  { command: 'why', description: '지금 움직임의 원인 요약: /why <종목>' },
   { command: 'status', description: '시세 연결·지연 상태' },
   { command: 'help', description: '사용법' },
 ];
@@ -53,6 +68,9 @@ const HELP = [
   '<code>/level &lt;종목&gt; &lt;가격&gt; [근접%] [메모]</code> — 레벨 알림 (근접 1회 + 도달 1회)',
   '<code>/levels</code>, <code>/unlevel &lt;id&gt;</code> — 레벨 알림 목록·삭제',
   '<code>/mute &lt;종목&gt; &lt;2h|30m|1d|off&gt;</code> — 일시 음소거',
+  '<code>/why &lt;종목&gt;</code> — 지금 움직임의 원인 요약 (뉴스 + AI)',
+  '',
+  '명령어 대신 문장으로도 됩니다. 예: "하이닉스 4% 움직이면 알려줘", "삼성전자 19만원 깨지면 알려줘". 실행 전에 확인 버튼이 나옵니다.',
   '<code>/status</code> — 시세 연결 상태, 종목별 마지막 quote·측정 지연',
   '',
   '알림은 기준을 처음 넘을 때 오고, 같은 날에는 다음 단계를 넘을 때만 다시 옵니다 (σ: 3→4→5→6, %: 5→7.5→10).',
@@ -132,20 +150,11 @@ export function parseLevelArgs(text: string): LevelArgs | { error: string } {
 }
 
 // ── 핸들러 ──────────────────────────────────────────────────
-export function registerCommands(bot: Bot, d: BotDeps): void {
+export function registerCommands(bot: Bot, d: BotDeps): Actions {
   const log = d.logger.child({ mod: 'commands' });
   const html = { parse_mode: 'HTML' as const };
 
   bot.command(['start', 'help'], (ctx) => ctx.reply(HELP, html));
-
-  const candidateButtons = (ctx: Context, cands: SymbolCandidate[], args: AddArgs) =>
-    d.choices.keyboard(
-      ctx.chat!.id,
-      cands.map((c) => ({
-        label: `${c.symbol} · ${c.description}`.slice(0, 60),
-        run: (c2) => addSymbol(c2, c.symbol, d.resolver.displayName(c.symbol), args),
-      })),
-    );
 
   const findWatch = (q: string) => d.repo.listWatch().find((w) => d.resolver.matches(q, w.symbol, w.display_name));
 
@@ -220,72 +229,6 @@ export function registerCommands(bot: Bot, d: BotDeps): void {
     );
   }
 
-  bot.command('add', async (ctx) => {
-    const args = parseAddArgs(ctx.match);
-    if ('error' in args) return void (await ctx.reply(args.error, html));
-    const r = await d.resolver.resolve(args.query).catch((e: Error) => {
-      log.warn({ err: e.message }, '종목 검색 실패');
-      return { kind: 'error' as const, message: e.message };
-    });
-    switch (r.kind) {
-      case 'resolved':
-        return addSymbol(ctx, r.symbol, r.displayName, args);
-      case 'choices':
-        await ctx.reply(`"${esc(args.query)}" 후보가 여러 개입니다. 선택하세요.`, {
-          ...html,
-          reply_markup: candidateButtons(ctx, r.candidates, args),
-        });
-        return;
-      case 'notfound':
-        await ctx.reply(
-          `"${esc(args.query)}"에 해당하는 종목을 찾지 못했습니다.\n` +
-            `<code>KRX:005930</code> 처럼 거래소:코드로 입력하거나 aliases.yaml에 별칭을 추가하세요.`,
-          html,
-        );
-        return;
-      case 'error':
-        await ctx.reply(`종목 검색 중 오류가 났습니다: ${esc(r.message)}`, html);
-    }
-  });
-
-  bot.command('remove', async (ctx) => {
-    const q = ctx.match.trim();
-    if (!q) return void (await ctx.reply('제거할 종목을 입력하세요. 예: <code>/remove 삼성전자</code>', html));
-    const hit = d.repo.listWatch().find((w) => d.resolver.matches(q, w.symbol, w.display_name));
-    if (!hit) return void (await ctx.reply(`watchlist에 없는 종목입니다: ${esc(q)}`, html));
-    d.repo.removeWatch(hit.symbol);
-    d.subs.request();
-    log.info({ symbol: hit.symbol }, 'watchlist 제거');
-    await ctx.reply(`제거했습니다: <b>${esc(hit.display_name ?? hit.symbol)}</b> <code>${esc(hit.symbol)}</code>`, html);
-  });
-
-  bot.command('list', async (ctx) => {
-    const items = d.repo.listWatch().map((w) => {
-      const snap = d.monitor.snapshot(w.symbol);
-      return { w, s: snap, today: d.engine.todaySteps(w, snap.sessionDate) };
-    });
-    await ctx.reply(formatList(items), html);
-  });
-
-  bot.command('mode', async (ctx) => {
-    const tokens = ctx.match.trim().split(/\s+/).filter(Boolean);
-    const usage = '형식: <code>/mode &lt;종목&gt; sigma|pct &lt;값&gt;</code>';
-    if (tokens.length < 3) return void (await ctx.reply(usage, html));
-    const mode = ModeSchema.safeParse(tokens.at(-2)!.toLowerCase());
-    const th = ThresholdSchema.safeParse(tokens.at(-1));
-    if (!mode.success || !th.success) return void (await ctx.reply(usage, html));
-    const q = tokens.slice(0, -2).join(' ');
-    const w = findWatch(q);
-    if (!w) return void (await ctx.reply(`watchlist에 없는 종목입니다: ${esc(q)}`, html));
-    d.repo.updateWatchMode(w.symbol, mode.data, th.data);
-    log.info({ symbol: w.symbol, mode: mode.data, threshold: th.data }, '기준 변경');
-    await ctx.reply(
-      `<b>${esc(w.display_name ?? w.symbol)}</b> 기준: ${thresholdLabel(w)} → ${thresholdLabel({ mode: mode.data, threshold: th.data })}\n` +
-        '오늘 이미 보낸 단계보다 높은 단계부터 알립니다.',
-      html,
-    );
-  });
-
   async function addLevel(ctx: Context, symbol: string, a: LevelArgs): Promise<void> {
     const meta = await ensureMeta(ctx, symbol, (c) => (c2) => addLevel(c2, c.symbol, a));
     if (!meta) return;
@@ -308,24 +251,154 @@ export function registerCommands(bot: Bot, d: BotDeps): void {
     );
   }
 
+  // ── 액션 (슬래시 명령과 자연어 의도가 같이 쓴다) ─────────────
+  async function resolveOrAsk(ctx: Context, query: string, run: (c: Context, symbol: string, aliasName: string | undefined) => Promise<void>): Promise<void> {
+    const w = findWatch(query);
+    if (w) return run(ctx, w.symbol, w.display_name ?? undefined);
+    const r = await d.resolver.resolve(query).catch((e: Error) => {
+      log.warn({ err: e.message }, '종목 검색 실패');
+      return { kind: 'error' as const, message: e.message };
+    });
+    switch (r.kind) {
+      case 'resolved':
+        return run(ctx, r.symbol, r.displayName);
+      case 'choices':
+        await ctx.reply(`"${esc(query)}" 후보가 여러 개입니다. 선택하세요.`, {
+          ...html,
+          reply_markup: d.choices.keyboard(
+            ctx.chat!.id,
+            r.candidates.map((c) => ({
+              label: `${c.symbol} · ${c.description}`.slice(0, 60),
+              run: (c2) => run(c2, c.symbol, d.resolver.displayName(c.symbol)),
+            })),
+          ),
+        });
+        return;
+      case 'notfound':
+        await ctx.reply(
+          `"${esc(query)}"에 해당하는 종목을 찾지 못했습니다.\n` +
+            `<code>KRX:005930</code> 처럼 거래소:코드로 입력하거나 aliases.yaml에 별칭을 추가하세요.`,
+          html,
+        );
+        return;
+      case 'error':
+        await ctx.reply(`종목 검색 중 오류가 났습니다: ${esc(r.message)}`, html);
+    }
+  }
+
+  const actions: Actions = {
+    add: (ctx, args) => resolveOrAsk(ctx, args.query, (c, sym, name) => addSymbol(c, sym, name, args)),
+
+    async remove(ctx, q) {
+      const hit = findWatch(q);
+      if (!hit) return void (await ctx.reply(`watchlist에 없는 종목입니다: ${esc(q)}`, html));
+      d.repo.removeWatch(hit.symbol);
+      d.subs.request();
+      log.info({ symbol: hit.symbol }, 'watchlist 제거');
+      await ctx.reply(`제거했습니다: <b>${esc(hit.display_name ?? hit.symbol)}</b> <code>${esc(hit.symbol)}</code>`, html);
+    },
+
+    async list(ctx) {
+      const items = d.repo.listWatch().map((w) => {
+        const snap = d.monitor.snapshot(w.symbol);
+        return { w, s: snap, today: d.engine.todaySteps(w, snap.sessionDate) };
+      });
+      await ctx.reply(formatList(items), html);
+    },
+
+    async mode(ctx, q, mode, threshold) {
+      const w = findWatch(q);
+      if (!w) return void (await ctx.reply(`watchlist에 없는 종목입니다: ${esc(q)}`, html));
+      d.repo.updateWatchMode(w.symbol, mode, threshold);
+      log.info({ symbol: w.symbol, mode, threshold }, '기준 변경');
+      await ctx.reply(
+        `<b>${esc(w.display_name ?? w.symbol)}</b> 기준: ${thresholdLabel(w)} → ${thresholdLabel({ mode, threshold })}\n` +
+          '오늘 이미 보낸 단계보다 높은 단계부터 알립니다.',
+        html,
+      );
+    },
+
+    level: (ctx, a) => resolveOrAsk(ctx, a.query, (c, sym) => addLevel(c, sym, a)),
+
+    async mute(ctx, q, ms) {
+      const w = findWatch(q);
+      if (!w) return void (await ctx.reply(`watchlist에 없는 종목입니다: ${esc(q)}`, html));
+      const name = esc(w.display_name ?? w.symbol);
+      if (ms === 0) {
+        d.repo.setMuted(w.symbol, null);
+        return void (await ctx.reply(`<b>${name}</b> 음소거를 해제했습니다.`, html));
+      }
+      const until = new Date(Date.now() + ms);
+      d.repo.setMuted(w.symbol, until.toISOString());
+      await ctx.reply(`<b>${name}</b> ${fmtKst(until)} KST까지 음소거합니다.`, html);
+    },
+
+    why: (ctx, q) => resolveOrAsk(ctx, q, (c, sym, name) => why(c, sym, name)),
+  };
+
+  /** /why: trigger 없이 지금 움직임의 원인 요약 */
+  async function why(ctx: Context, symbol: string, aliasName: string | undefined): Promise<void> {
+    let snap = d.monitor.snapshot(symbol);
+    let meta = d.repo.getMeta(symbol);
+    if (!snap.quote) {
+      // 구독하지 않은 종목: 메타·일봉·quote를 직접 받는다
+      const m = await ensureMeta(ctx, symbol, (c) => (c2) => why(c2, c.symbol, d.resolver.displayName(c.symbol)));
+      if (!m) return;
+      await d.history.refresh(symbol).catch(() => 0);
+      snap = d.monitor.snapshotWith(await d.md.quote(symbol));
+      meta = d.repo.getMeta(symbol);
+    }
+    const name = aliasName ?? d.repo.getWatch(symbol)?.display_name ?? d.resolver.displayName(symbol) ?? meta?.description ?? symbol;
+    const q = snap.quote!;
+    const head =
+      `<b>${esc(name)}</b> <code>${esc(symbol)}</code>  ${fmtPrice(q.price)}  ${fmtPct(snap.r)} · ${fmtZ(snap.z)}` +
+      `${delayTag(snap)}\n가격 시각 ${fmtKst(q.priceTime)} KST`;
+    const msg = await ctx.reply(`${head}\n\n<i>원인 분석 중…</i>`, { ...html, link_preview_options: { is_disabled: true } });
+    const benchSym = d.cfg.benchmarks[snap.market];
+    const bench =
+      benchSym && benchSym !== symbol
+        ? (() => {
+            const b = d.monitor.snapshot(benchSym);
+            return { name: d.resolver.displayName(benchSym) ?? benchSym, r: b.r, delayed: b.delay.delayed };
+          })()
+        : undefined;
+    const res = await d.explainer.explain({ symbol, name, description: meta?.description ?? undefined, snapshot: snap, benchmark: bench });
+    log.info({ symbol, confidence: res.explanation.confidence, sources: res.explanation.sources.length, fallback: res.fallback }, '/why');
+    await ctx.api.editMessageText(msg.chat.id, msg.message_id, `${head}\n\n${formatExplanation(res)}`, {
+      ...html,
+      link_preview_options: { is_disabled: true },
+    });
+  }
+
+  // ── 슬래시 명령 ─────────────────────────────────────────────
+  bot.command('add', async (ctx) => {
+    const args = parseAddArgs(ctx.match);
+    if ('error' in args) return void (await ctx.reply(args.error, html));
+    await actions.add(ctx, args);
+  });
+
+  bot.command('remove', async (ctx) => {
+    const q = ctx.match.trim();
+    if (!q) return void (await ctx.reply('제거할 종목을 입력하세요. 예: <code>/remove 삼성전자</code>', html));
+    await actions.remove(ctx, q);
+  });
+
+  bot.command('list', (ctx) => actions.list(ctx));
+
+  bot.command('mode', async (ctx) => {
+    const tokens = ctx.match.trim().split(/\s+/).filter(Boolean);
+    const usage = '형식: <code>/mode &lt;종목&gt; sigma|pct &lt;값&gt;</code>';
+    if (tokens.length < 3) return void (await ctx.reply(usage, html));
+    const mode = ModeSchema.safeParse(tokens.at(-2)!.toLowerCase());
+    const th = ThresholdSchema.safeParse(tokens.at(-1));
+    if (!mode.success || !th.success) return void (await ctx.reply(usage, html));
+    await actions.mode(ctx, tokens.slice(0, -2).join(' '), mode.data, th.data);
+  });
+
   bot.command('level', async (ctx) => {
     const a = parseLevelArgs(ctx.match);
     if ('error' in a) return void (await ctx.reply(a.error, html));
-    const w = findWatch(a.query);
-    if (w) return addLevel(ctx, w.symbol, a);
-    const r = await d.resolver.resolve(a.query);
-    if (r.kind === 'resolved') return addLevel(ctx, r.symbol, a);
-    if (r.kind === 'choices') {
-      await ctx.reply(`"${esc(a.query)}" 후보가 여러 개입니다. 선택하세요.`, {
-        ...html,
-        reply_markup: d.choices.keyboard(
-          ctx.chat!.id,
-          r.candidates.map((c) => ({ label: `${c.symbol} · ${c.description}`.slice(0, 60), run: (c2) => addLevel(c2, c.symbol, a) })),
-        ),
-      });
-      return;
-    }
-    await ctx.reply(`"${esc(a.query)}"에 해당하는 종목을 찾지 못했습니다.`, html);
+    await actions.level(ctx, a);
   });
 
   bot.command('levels', async (ctx) => {
@@ -356,22 +429,26 @@ export function registerCommands(bot: Bot, d: BotDeps): void {
     if (tokens.length < 2) return void (await ctx.reply(usage, html));
     const ms = parseDuration(tokens.at(-1)!);
     if (ms === undefined) return void (await ctx.reply(usage, html));
-    const q = tokens.slice(0, -1).join(' ');
-    const w = findWatch(q);
-    if (!w) return void (await ctx.reply(`watchlist에 없는 종목입니다: ${esc(q)}`, html));
-    const name = esc(w.display_name ?? w.symbol);
-    if (ms === 0) {
-      d.repo.setMuted(w.symbol, null);
-      return void (await ctx.reply(`<b>${name}</b> 음소거를 해제했습니다.`, html));
-    }
-    const until = new Date(Date.now() + ms);
-    d.repo.setMuted(w.symbol, until.toISOString());
-    await ctx.reply(`<b>${name}</b> ${fmtKst(until)} KST까지 음소거합니다.`, html);
+    await actions.mute(ctx, tokens.slice(0, -1).join(' '), ms);
+  });
+
+  bot.command('why', async (ctx) => {
+    const q = ctx.match.trim();
+    if (!q) return void (await ctx.reply('형식: <code>/why &lt;종목&gt;</code>', html));
+    await actions.why(ctx, q);
   });
 
   bot.command('status', async (ctx) => {
     const st = d.md.status();
-    const snaps = st.symbols.map((s) => d.monitor.snapshot(s));
-    await ctx.reply(formatStatus(st, snaps), html);
+    const watch = new Map(d.repo.listWatch().map((w) => [w.symbol, w]));
+    const benches = new Set(Object.values(d.cfg.benchmarks));
+    const rows = st.symbols.map((s) => ({
+      snap: d.monitor.snapshot(s),
+      name: watch.get(s)?.display_name ?? d.resolver.displayName(s) ?? d.repo.getMeta(s)?.description ?? s,
+      role: watch.has(s) ? ('watch' as const) : benches.has(s) ? ('benchmark' as const) : ('level' as const),
+    }));
+    await ctx.reply(formatStatus(st, rows), html);
   });
+
+  return actions;
 }

@@ -293,6 +293,17 @@ export class TradingViewMarketData implements MarketData {
   }
 
   // ── 단발 조회 ──────────────────────────────────────────────
+  async quote(symbol: string): Promise<Quote> {
+    const data = await withRetry(() =>
+      getQuote({ symbol, fields: QUOTE_FIELDS, timeoutMs: CALL_TIMEOUT_MS, ...this.connOpts }),
+    ).catch((e) => {
+      throw toMdError(e, symbol);
+    });
+    const q = toQuote(symbol, data);
+    if (!q) throw new MarketDataError('QUOTE_ERROR', '가격 정보가 없습니다', symbol);
+    return q;
+  }
+
   async dailyBars(symbol: string, count: number): Promise<Bar[]> {
     const raw = await withRetry(() =>
       getCandles({ symbol, timeframe: 'D', count, timeoutMs: CALL_TIMEOUT_MS, ...this.connOpts }),

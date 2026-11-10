@@ -2,6 +2,10 @@ import { Api } from 'grammy';
 import { createBot, startBot } from './bot/bot.js';
 import { AlertNotifier } from './bot/notifier.js';
 import { TriggerEngine } from './triggers/engine.js';
+import { AlertEnricher } from './agent/alertEnricher.js';
+import { Explainer } from './agent/explain.js';
+import { GroqClient } from './agent/llm.js';
+import { GoogleNewsRss } from './agent/news.js';
 import { Choices } from './bot/confirm.js';
 import { loadConfig } from './config.js';
 import { Repo } from './db/repo.js';
@@ -38,7 +42,13 @@ async function main(): Promise<void> {
   const resolver = new SymbolResolver(conf.aliases, md);
   const choices = new Choices(logger);
 
-  const notifier = new AlertNotifier(new Api(env.TELEGRAM_BOT_TOKEN), env.TELEGRAM_ALLOWED_CHAT_IDS, repo, logger);
+  const llm = env.GROQ_API_KEY
+    ? new GroqClient(env.GROQ_API_KEY, { fast: env.GROQ_MODEL_FAST, smart: env.GROQ_MODEL_SMART }, logger)
+    : undefined;
+  logger.info({ llm: llm ? `groq (${env.GROQ_MODEL_FAST} / ${env.GROQ_MODEL_SMART})` : 'none' }, 'LLM 설정');
+  const explainer = new Explainer(llm, new GoogleNewsRss(logger), logger);
+  const enricher = new AlertEnricher(explainer, repo, logger);
+  const notifier = new AlertNotifier(new Api(env.TELEGRAM_BOT_TOKEN), env.TELEGRAM_ALLOWED_CHAT_IDS, repo, logger, 60_000, enricher);
   const engine = new TriggerEngine({
     repo,
     monitor,
@@ -86,8 +96,8 @@ async function main(): Promise<void> {
   const crons = scheduleDailyBars(cfg.daily_bars_refresh, history, () => subs.desired(), logger);
 
   const bot = createBot(env.TELEGRAM_BOT_TOKEN, env.TELEGRAM_ALLOWED_CHAT_IDS, {
-    cfg, repo, md, monitor, history, subs, resolver, choices, engine, logger,
-  });
+    cfg, repo, md, monitor, history, subs, resolver, choices, engine, explainer, logger,
+  }, llm);
   await startBot(bot, logger);
 
   let stopping = false;

@@ -28,6 +28,12 @@ export class FakeMarketData implements MarketData {
   replay(quotes: Quote[]): void {
     for (const q of quotes) this.onQuote?.(q);
   }
+  quotes = new Map<string, Quote>();
+  async quote(symbol: string): Promise<Quote> {
+    const q = this.quotes.get(symbol);
+    if (!q) throw new MarketDataError('QUOTE_ERROR', 'no quote', symbol);
+    return q;
+  }
   async dailyBars(symbol: string, count: number): Promise<Bar[]> {
     return (this.bars.get(symbol) ?? []).slice(-count);
   }

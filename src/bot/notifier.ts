@@ -12,6 +12,21 @@ interface OpenMessage {
   blocks: string[];
   messages: { chatId: number; messageId: number }[];
   until: number;
+  /** 원인 요약 (준비 전이면 undefined, 실패하면 '') */
+  explanation: string | undefined;
+}
+
+/** 숫자 알림 뒤에 붙일 원인 요약을 만든다 (Phase 4) */
+export interface Enricher {
+  enrich(ev: AlertEvent, alertIds: number[]): Promise<{ html: string } | undefined>;
+}
+
+const PENDING = '<i>원인 분석 중…</i>';
+
+function render(m: Pick<OpenMessage, 'blocks' | 'explanation'>, enrich: boolean): string {
+  const body = m.blocks.join('\n\n');
+  if (!enrich || m.explanation === '') return body;
+  return `${body}\n\n${m.explanation ?? PENDING}`;
 }
 
 export class AlertNotifier implements AlertSink {
@@ -26,6 +41,7 @@ export class AlertNotifier implements AlertSink {
     private readonly repo: Repo,
     logger: Logger,
     private readonly mergeWindowMs = 60_000,
+    private readonly enricher?: Enricher,
   ) {
     this.log = logger.child({ mod: 'notifier' });
   }
@@ -46,29 +62,60 @@ export class AlertNotifier implements AlertSink {
 
     if (cur && Date.now() < cur.until) {
       cur.blocks.push(...blocks);
-      const text = cur.blocks.join('\n\n');
-      let ok = true;
-      for (const m of cur.messages) {
-        try {
-          await this.api.editMessageText(m.chatId, m.messageId, text, { parse_mode: 'HTML', link_preview_options: { is_disabled: true } });
-        } catch (e) {
-          ok = false;
-          this.log.warn({ symbol, err: (e as Error).message }, '알림 합치기(edit) 실패 → 새 메시지');
-        }
-      }
-      if (ok) {
+      if (await this.editAll(symbol, cur)) {
         if (cur.messages[0]) this.repo.setAlertMessageId(ids, cur.messages[0].messageId);
+        if (cur.explanation !== undefined && cur.explanation !== '' && this.enricher) {
+          // 합쳐진 알림에도 원인을 기록 (캐시 재사용)
+          void this.enricher.enrich(events[0]!, ids).catch(() => undefined);
+        }
         return;
       }
     }
 
-    const text = blocks.join('\n\n');
-    const messages: OpenMessage['messages'] = [];
+    const m: OpenMessage = { blocks, messages: [], until: Date.now() + this.mergeWindowMs, explanation: undefined };
+    const text = render(m, !!this.enricher);
     for (const chatId of this.chatIds) {
       const msg = await this.api.sendMessage(chatId, text, { parse_mode: 'HTML', link_preview_options: { is_disabled: true } });
-      messages.push({ chatId, messageId: msg.message_id });
+      m.messages.push({ chatId, messageId: msg.message_id });
     }
-    if (messages[0]) this.repo.setAlertMessageId(ids, messages[0].messageId);
-    this.open.set(symbol, { blocks, messages, until: Date.now() + this.mergeWindowMs });
+    if (m.messages[0]) this.repo.setAlertMessageId(ids, m.messages[0].messageId);
+    this.open.set(symbol, m);
+
+    // 원인 요약은 숫자 알림이 나간 뒤 비동기로 붙인다
+    if (this.enricher) void this.attachExplanation(symbol, m, events[0]!, ids);
+  }
+
+  private async attachExplanation(symbol: string, m: OpenMessage, ev: AlertEvent, ids: number[]): Promise<void> {
+    let html = '';
+    try {
+      html = (await this.enricher!.enrich(ev, ids))?.html ?? '';
+    } catch (e) {
+      this.log.warn({ symbol, err: (e as Error).message }, '원인 요약 실패');
+    }
+    m.explanation = html;
+    // 같은 종목 전송과 겹치지 않게 체인에 넣는다
+    const prev = this.chains.get(symbol) ?? Promise.resolve();
+    const next = prev.then(() => this.editAll(symbol, m)).then(() => undefined);
+    this.chains.set(symbol, next);
+    await next;
+  }
+
+  private async editAll(symbol: string, m: OpenMessage): Promise<boolean> {
+    const text = render(m, !!this.enricher);
+    let ok = true;
+    for (const msg of m.messages) {
+      try {
+        await this.api.editMessageText(msg.chatId, msg.messageId, text, {
+          parse_mode: 'HTML',
+          link_preview_options: { is_disabled: true },
+        });
+      } catch (e) {
+        const desc = (e as Error).message;
+        if (/message is not modified/.test(desc)) continue;
+        ok = false;
+        this.log.warn({ symbol, err: desc }, '알림 edit 실패');
+      }
+    }
+    return ok;
   }
 }

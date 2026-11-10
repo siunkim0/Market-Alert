@@ -54,26 +54,44 @@ export function formatList(items: { w: WatchRow; s: Snapshot; today?: string | u
   return `<b>Watchlist</b> (${items.length})\n\n${lines.join('\n\n')}`;
 }
 
-export function formatStatus(st: FeedStatus, snaps: Snapshot[], now = new Date()): string {
+export interface StatusRow {
+  snap: Snapshot;
+  name: string;
+  /** watchlist | benchmark(비교 지수) | level(레벨 알림만) */
+  role: 'watch' | 'benchmark' | 'level';
+}
+
+export function formatStatus(st: FeedStatus, rows: StatusRow[], now = new Date()): string {
   const conn = st.connected ? '🟢 연결됨' : '🔴 끊김';
+  const counts = { watch: 0, benchmark: 0, level: 0 };
+  for (const r of rows) counts[r.role]++;
+  const extra = [counts.benchmark ? `비교 지수 ${counts.benchmark}` : '', counts.level ? `레벨 전용 ${counts.level}` : '']
+    .filter(Boolean)
+    .join(', ');
   const head = [
     `<b>시세 연결</b>: ${conn} · 재연결 ${st.reconnects}회`,
-    `구독 ${st.symbols.length}종목 · 마지막 quote ${st.lastQuoteAt ? fmtKst(st.lastQuoteAt, now) : '-'}` +
-      ` · 마지막 연결 ${st.lastConnectAt ? fmtKst(st.lastConnectAt, now) : '-'}`,
+    `구독 ${st.symbols.length}종목 (watchlist ${counts.watch}${extra ? `, ${extra}` : ''})`,
+    `마지막 quote ${st.lastQuoteAt ? fmtKst(st.lastQuoteAt, now) : '-'} · 마지막 연결 ${st.lastConnectAt ? fmtKst(st.lastConnectAt, now) : '-'}`,
   ];
   if (st.lastError) head.push(`최근 오류: ${esc(st.lastError)}`);
-  const rows = snaps.map((s) => {
-    if (!s.quote) return `<code>${esc(s.symbol)}</code> quote 없음`;
-    const lag = s.delay.lastLagSec !== null ? `lag ${s.delay.lastLagSec}s` : 'lag -';
+  const order = { watch: 0, level: 1, benchmark: 2 };
+  const sorted = [...rows].sort((a, b) => order[a.role] - order[b.role]);
+  const lines = sorted.map(({ snap: s, role, name }) => {
+    const tag = role === 'benchmark' ? ' (비교 지수)' : role === 'level' ? ' (레벨)' : '';
+    const label = name && name !== s.symbol ? `<b>${esc(name)}</b> <code>${esc(s.symbol)}</code>` : `<code>${esc(s.symbol)}</code>`;
+    if (!s.quote) return `${label}${tag} quote 없음`;
     const d = s.delay.delayed
       ? `지연 ${s.delay.delaySec ?? '?'}s (${s.delay.source === 'update_mode' ? 'TV 표시' : '측정'})`
       : '실시간';
+    // 장 마감 중 lag는 마지막 체결 이후 경과 시간일 뿐이라 표시하지 않는다
+    const lag = s.marketOpen ? ` · lag ${s.delay.lastLagSec ?? '-'}s` : '';
     return (
-      `<code>${esc(s.symbol)}</code> 수신 ${fmtKst(s.quote.receivedAt, now)} · 가격 ${fmtKst(s.quote.priceTime, now)}` +
-      ` · ${lag} · ${d}${s.marketOpen ? '' : ' · 장 마감'}`
+      `${label}${tag} ${fmtPrice(s.quote.price)} (${fmtPct(s.r)})\n` +
+      `   가격 시각 ${fmtKst(s.quote.priceTime, now)} · 수신 ${fmtKst(s.quote.receivedAt, now)}` +
+      `${lag} · ${d}${s.marketOpen ? '' : ' · 장 마감'}`
     );
   });
-  return `${head.join('\n')}\n\n<b>종목별</b>\n${rows.join('\n') || '(없음)'}`;
+  return `${head.join('\n')}\n\n<b>종목별</b>\n${lines.join('\n') || '(없음)'}`;
 }
 
 // ── 알림 ─────────────────────────────────────────────────────
@@ -127,4 +145,25 @@ export function formatAlertBlock(ev: AlertEvent, now = new Date()): string {
   ].filter(Boolean);
 
   return [`${head}${delayTag(s)}${startup}`, info.join(' | '), tail].filter(Boolean).join('\n');
+}
+
+// ── 원인 요약 ────────────────────────────────────────────────
+import type { ExplainResult } from '../agent/explain.js';
+
+function link(title: string, url: string): string {
+  const t = title.length > 40 ? `${title.slice(0, 40)}…` : title;
+  return `<a href="${esc(url).replace(/"/g, '&quot;')}">${esc(t)}</a>`;
+}
+
+export function formatExplanation(res: ExplainResult): string {
+  const e = res.explanation;
+  const scope = e.market_wide ? '→ 시장 전체 움직임' : '→ 종목 고유 움직임';
+  if (res.fallback && res.articles.length > 0) {
+    // LLM 키 없음·실패: 기사 제목만 보여 준다
+    const heads = res.articles.slice(0, 3).map((a) => `• ${link(a.title, a.url)}`);
+    return `${scope} (지수 기준 추정)\n원인 요약을 만들지 못했습니다. 최근 기사:\n${heads.join('\n')}`;
+  }
+  const lines = [scope, `원인 (confidence: ${e.confidence})`, ...e.summary.map((s, i) => `${i + 1}. ${esc(s)}`)];
+  if (e.sources.length > 0) lines.push(`근거: ${e.sources.map((s) => link(s.title, s.url)).join(' · ')}`);
+  return lines.join('\n');
 }

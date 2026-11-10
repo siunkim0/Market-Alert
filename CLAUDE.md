@@ -12,6 +12,8 @@ Telegram 마켓 알림 봇 + 매매 기록. watchlist와 보유 포지션을 Tra
 - `src/bot/` grammy 봇, 명령어, 메시지 포맷
 - `src/jobs/` 스케줄 작업
 - 설정: `.env`(키), `config.yaml`(threshold·규칙), `aliases.yaml`(종목 별칭)
+- LLM: Groq(OpenAI 호환, `src/agent/llm.ts`의 `LlmClient`). fast=`openai/gpt-oss-20b`(자연어→tool), smart=`openai/gpt-oss-120b`(원인 요약)
+- 뉴스: Google News RSS (`src/agent/news.ts`의 `NewsSource`). 네이버·Finnhub는 키가 생기면 같은 인터페이스로 추가
 
 ## 명령
 - `npm run dev` 개발 실행 (tsx watch + pino-pretty)

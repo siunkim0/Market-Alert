@@ -101,7 +101,15 @@ export class MarketMonitor {
   }
 
   snapshot(symbol: string, now = new Date()): Snapshot {
-    const quote = this.latest.get(symbol);
+    return this.compute(symbol, this.latest.get(symbol), now);
+  }
+
+  /** 구독하지 않은 종목: 따로 받은 quote로 같은 계산을 한다 (상태는 저장하지 않음) */
+  snapshotWith(q: Quote, now = new Date()): Snapshot {
+    return this.compute(q.symbol, q, now);
+  }
+
+  private compute(symbol: string, quote: Quote | undefined, now: Date): Snapshot {
     const delay = this.delay.get(symbol);
     const spec = this.spec(symbol);
     const delaySec = delay.delaySec ?? 0;

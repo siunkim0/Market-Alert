@@ -27,6 +27,7 @@ export class Journal {
   private readonly log: Logger;
   private cache: ReplayResult | undefined;
   private readonly listeners: (() => void)[] = [];
+  private readonly recordListeners: ((trades: TradeRow[]) => void)[] = [];
 
   constructor(private readonly repo: Repo, logger: Logger) {
     this.log = logger.child({ mod: 'journal' });
@@ -34,6 +35,23 @@ export class Journal {
 
   onChange(fn: () => void): void {
     this.listeners.push(fn);
+  }
+
+  /** 새 체결이 기록됐을 때 (수동·동기화 모두). 규칙 체크용 */
+  onRecorded(fn: (trades: TradeRow[]) => void): void {
+    this.recordListeners.push(fn);
+  }
+
+  private recorded(ids: number[]): void {
+    if (ids.length === 0) return;
+    const rows = ids.map((id) => this.repo.getTrade(id)).filter((t): t is TradeRow => !!t);
+    for (const fn of this.recordListeners) {
+      try {
+        fn(rows);
+      } catch (e) {
+        this.log.error({ err: (e as Error).message }, 'record listener 오류');
+      }
+    }
   }
 
   private changed(): void {
@@ -115,13 +133,14 @@ export class Journal {
     this.changed();
     const trade = this.repo.getTrade(id)!;
     const gid = this.state().tradeGroup.get(id);
+    this.recorded([id]);
     this.log.info({ id, symbol: i.symbol, side: i.side, qty: i.qty, price: i.price, source: i.source }, '체결 기록');
     return { trade, position: this.position(i.symbol), group: gid ? this.group(gid) : undefined };
   }
 
   /** 여러 건을 한 번에 (동기화). 새로 들어간 건수 */
   recordMany(items: RecordInput[]): number {
-    let n = 0;
+    const ids: number[] = [];
     for (const i of items) {
       const id = this.repo.insertTrade({
         source: i.source,
@@ -139,10 +158,13 @@ export class Journal {
         note: i.note ?? null,
         realized_pnl: i.realizedPnl ?? null,
       });
-      if (id !== null) n++;
+      if (id !== null) ids.push(id);
     }
-    if (n > 0) this.changed();
-    return n;
+    if (ids.length > 0) {
+      this.changed();
+      this.recorded(ids);
+    }
+    return ids.length;
   }
 
   /** 보유 포지션의 손절·익절가 설정. 포지션이 없으면 undefined */

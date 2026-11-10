@@ -2,9 +2,15 @@ import { Bot, GrammyError, HttpError } from 'grammy';
 import type { Logger } from '../logger.js';
 import type { LlmClient } from '../agent/llm.js';
 import { COMMANDS, registerCommands, type BotDeps } from './commands.js';
-import { registerNaturalLanguage } from './naturalLanguage.js';
+import { registerNaturalLanguage, type PendingStops } from './naturalLanguage.js';
 
-export function createBot(token: string, allowedChatIds: number[], deps: BotDeps, llm: LlmClient | undefined): Bot {
+export function createBot(
+  token: string,
+  allowedChatIds: number[],
+  deps: BotDeps,
+  llm: LlmClient | undefined,
+  pendingStops: PendingStops,
+): Bot {
   const log = deps.logger.child({ mod: 'bot' });
   const allowed = new Set(allowedChatIds);
   const bot = new Bot(token);
@@ -22,7 +28,7 @@ export function createBot(token: string, allowedChatIds: number[], deps: BotDeps
   deps.choices.register(bot);
   const actions = registerCommands(bot, deps);
   // 명령어 핸들러 뒤에 등록해야 명령어가 먼저 처리된다
-  registerNaturalLanguage(bot, { llm, actions, choices: deps.choices, resolver: deps.resolver, logger: deps.logger });
+  registerNaturalLanguage(bot, { llm, actions, choices: deps.choices, resolver: deps.resolver, pendingStops, logger: deps.logger });
 
   bot.catch((err) => {
     const e = err.error;

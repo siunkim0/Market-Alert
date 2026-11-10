@@ -7,7 +7,11 @@
     "start": "node dist/main.js",
     "build": "tsc -p tsconfig.build.json && cp src/db/schema.sql dist/db/",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "service:install": "zsh scripts/launchd-install.sh",
+    "service:uninstall": "zsh scripts/launchd-uninstall.sh",
+    "service:restart": "zsh scripts/launchd-restart.sh",
+    "service:logs": "tail -f ~/Library/Logs/5sigma-alert/out.log | pino-pretty --translateTime SYS:HH:MM:ss --ignore pid,hostname"
   },
   "type": "module",
   "dependencies": {

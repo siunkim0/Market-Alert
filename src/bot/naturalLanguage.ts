@@ -91,9 +91,33 @@ export function runIntent(i: Intent, ctx: Context, actions: Actions): Promise<vo
   }
 }
 
+/** "손절가 입력" 버튼을 누른 뒤 다음 숫자 메시지를 손절가로 받는다 */
+export class PendingStops {
+  private readonly m = new Map<number, { symbol: string; until: number }>();
+  set(chatId: number, symbol: string): void {
+    this.m.set(chatId, { symbol, until: Date.now() + 5 * 60_000 });
+  }
+  take(chatId: number): string | undefined {
+    const p = this.m.get(chatId);
+    this.m.delete(chatId);
+    return p && p.until > Date.now() ? p.symbol : undefined;
+  }
+  has(chatId: number): boolean {
+    const p = this.m.get(chatId);
+    return !!p && p.until > Date.now();
+  }
+}
+
 export function registerNaturalLanguage(
   bot: Bot,
-  deps: { llm: LlmClient | undefined; actions: Actions; choices: Choices; resolver: SymbolResolver; logger: Logger },
+  deps: {
+    llm: LlmClient | undefined;
+    actions: Actions;
+    choices: Choices;
+    resolver: SymbolResolver;
+    pendingStops: PendingStops;
+    logger: Logger;
+  },
 ): void {
   const log = deps.logger.child({ mod: 'nl' });
   const html = { parse_mode: 'HTML' as const };
@@ -102,6 +126,14 @@ export function registerNaturalLanguage(
     const text = ctx.message.text.trim();
     if (text.startsWith('/')) {
       await ctx.reply('알 수 없는 명령어입니다. /help 를 참고하세요.');
+      return;
+    }
+    // 손절가 입력 대기 중이면 숫자를 손절가로
+    if (deps.pendingStops.has(ctx.chat.id)) {
+      const n = Number(text.replace(/[,\s원]/g, ''));
+      const symbol = deps.pendingStops.take(ctx.chat.id)!;
+      if (Number.isFinite(n) && n > 0) return void (await deps.actions.stop(ctx, symbol, 'sl', n));
+      await ctx.reply('숫자가 아니어서 손절가 입력을 취소했습니다.');
       return;
     }
     if (!deps.llm) {

@@ -334,6 +334,44 @@ export class Repo {
       .run(source, nowIso(), cursor);
   }
 
+  // ── rule_violations ────────────────────────────────────────
+  /** 같은 (rule, trade_group)은 한 번만. 새로 기록되면 true */
+  addViolation(v: { rule: string; symbol: string; tradeGroup: string | null; detail: string; at?: Date }): boolean {
+    return (
+      this.db
+        .prepare(
+          `INSERT INTO rule_violations (rule, symbol, trade_group, detail, occurred_at) VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(rule, trade_group) DO NOTHING`,
+        )
+        .run(v.rule, v.symbol, v.tradeGroup, v.detail, (v.at ?? new Date()).toISOString()).changes > 0
+    );
+  }
+
+  violationsSince(sinceIso: string): { rule: string; symbol: string; trade_group: string | null; detail: string; occurred_at: string }[] {
+    return this.db
+      .prepare('SELECT rule, symbol, trade_group, detail, occurred_at FROM rule_violations WHERE occurred_at >= ? ORDER BY occurred_at')
+      .all(sinceIso) as { rule: string; symbol: string; trade_group: string | null; detail: string; occurred_at: string }[];
+  }
+
+  // ── settings ───────────────────────────────────────────────
+  getSetting(key: string): string | undefined {
+    return (this.db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as { value: string } | undefined)?.value;
+  }
+
+  setSetting(key: string, value: string): void {
+    this.db
+      .prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+      .run(key, value);
+  }
+
+  alertsForSession(sessionDate: string, symbols: string[]): AlertLogRow[] {
+    if (symbols.length === 0) return [];
+    const ph = symbols.map(() => '?').join(',');
+    return this.db
+      .prepare(`SELECT * FROM alert_log WHERE session_date = ? AND symbol IN (${ph}) ORDER BY id`)
+      .all(sessionDate, ...symbols) as AlertLogRow[];
+  }
+
   // ── symbol_meta ────────────────────────────────────────────
   upsertMeta(m: { symbol: string; description: string | null; currency: string | null; timezone: string; session: string }): void {
     this.db

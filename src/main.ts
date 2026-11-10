@@ -9,6 +9,10 @@ import { GoogleNewsRss } from './agent/news.js';
 import { Journal } from './journal/journal.js';
 import { BinanceFuturesImporter } from './journal/importers/binanceFutures.js';
 import { scheduleSync } from './jobs/sync.js';
+import { DigestService } from './jobs/digest.js';
+import { RulesChecker } from './journal/rulesCheck.js';
+import { PendingStops } from './bot/naturalLanguage.js';
+import { esc } from './bot/format.js';
 import { Choices } from './bot/confirm.js';
 import { loadConfig } from './config.js';
 import { Repo } from './db/repo.js';
@@ -111,15 +115,62 @@ async function main(): Promise<void> {
     (e) => logger.warn({ code: e.code, symbol: e.symbol, err: e.message }, '시세 오류'),
   );
 
+  const telegram = new Api(env.TELEGRAM_BOT_TOKEN);
+  const nameOf = (s: string) => repo.getWatch(s)?.display_name ?? resolver.displayName(s) ?? repo.getMeta(s)?.description ?? s;
+  const broadcast = async (html: string, keyboardFor?: (chatId: number) => ReturnType<Choices['keyboard']>) => {
+    for (const chatId of env.TELEGRAM_ALLOWED_CHAT_IDS) {
+      await telegram
+        .sendMessage(chatId, html, { parse_mode: 'HTML', link_preview_options: { is_disabled: true }, reply_markup: keyboardFor?.(chatId) })
+        .catch((e: Error) => logger.error({ err: e.message }, '메시지 전송 실패'));
+    }
+  };
+
+  // 매매 규칙 체크: 새 체결마다
+  const rules = new RulesChecker(repo, journal, cfg.trading_rules, logger);
+  const pendingStops = new PendingStops();
+  journal.onRecorded((trades) => {
+    const warnings = rules.check(trades);
+    // 기록 확인 메시지 뒤에 오도록 잠깐 늦춘다
+    setTimeout(() => {
+      for (const w of warnings) {
+        const text = `${w.text}\n<b>${esc(nameOf(w.symbol))}</b> <code>${esc(w.symbol)}</code> · 거래 ${w.groupId}`;
+        void broadcast(
+          text,
+          w.askStop
+            ? (chatId) =>
+                choices.keyboard(chatId, [
+                  {
+                    label: '손절가 입력',
+                    run: async (c) => {
+                      pendingStops.set(chatId, w.symbol);
+                      await c.reply(`${nameOf(w.symbol)} 손절가를 숫자로 보내 주세요. (예: 190000)`);
+                    },
+                  },
+                ], '나중에')
+            : undefined,
+        );
+      }
+    }, 500);
+  });
+
+  const digest = new DigestService({
+    repo, history, journal, benchmarks: cfg.benchmarks,
+    symbols: () => [...new Set([...repo.listWatch().map((w) => w.symbol), ...journal.openSymbols()])],
+    nameOf,
+    send: (html) => broadcast(html),
+    logger,
+  });
+
   const crons = scheduleDailyBars(cfg.daily_bars_refresh, history, () => subs.desired(), logger);
+  crons.push(...digest.schedule(cfg.digest));
   if (syncer) {
     crons.push(scheduleSync(cfg.journal_sync_minutes, syncer, logger));
     void syncer.sync().catch((e: Error) => logger.warn({ err: e.message }, '첫 Binance 동기화 실패'));
   }
 
   const bot = createBot(env.TELEGRAM_BOT_TOKEN, env.TELEGRAM_ALLOWED_CHAT_IDS, {
-    cfg, repo, md, monitor, history, subs, resolver, choices, engine, explainer, journal, syncer, logger,
-  }, llm);
+    cfg, repo, md, monitor, history, subs, resolver, choices, engine, explainer, journal, syncer, rules, digest, logger,
+  }, llm, pendingStops);
   await startBot(bot, logger);
 
   let stopping = false;

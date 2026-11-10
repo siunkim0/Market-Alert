@@ -11,7 +11,9 @@ import type { SymbolResolver } from '../market/symbols.js';
 import type { TriggerEngine } from '../triggers/engine.js';
 import type { Explainer } from '../agent/explain.js';
 import type { Journal } from '../journal/journal.js';
-import { periodStats, type Period } from '../journal/pnl.js';
+import { periodStart, periodStats, type Period } from '../journal/pnl.js';
+import { RULE_LABEL, type RulesChecker, type RuleName } from '../journal/rulesCheck.js';
+import type { DigestMarket, DigestService } from '../jobs/digest.js';
 import { InputFile } from 'grammy';
 import {
   formatHistory, formatPnl, formatPositions, formatRecorded, positionMismatches, tradesCsv,
@@ -51,6 +53,8 @@ export interface BotDeps {
   journal: Journal;
   /** Binance 동기화 (키가 없으면 undefined) */
   syncer?: { sync(): Promise<{ inserted: number; symbols: string[] }> } | undefined;
+  rules: RulesChecker;
+  digest: DigestService;
   logger: Logger;
 }
 
@@ -75,6 +79,9 @@ export const COMMANDS: { command: string; description: string }[] = [
   { command: 'deltrade', description: '수동 기록 삭제: /deltrade <기록ID>' },
   { command: 'export', description: '매매 기록 CSV' },
   { command: 'sync', description: 'Binance 체결 즉시 동기화' },
+  { command: 'rules', description: '매매 규칙 위반 현황' },
+  { command: 'digest', description: '장 마감 요약: /digest on|off|krx|us|crypto' },
+  { command: 'import_tv', description: 'TradingView watchlist 가져오기 (쿠키 필요)' },
   { command: 'status', description: '시세 연결·지연 상태' },
   { command: 'help', description: '사용법' },
 ];
@@ -97,6 +104,8 @@ const HELP = [
   '<code>/sl &lt;종목&gt; &lt;가격&gt;</code>, <code>/tp &lt;종목&gt; &lt;가격&gt;</code> — 보유 포지션 손절·익절가 (근접·도달 알림)',
   '<code>/pos</code> 포지션 · <code>/history [n|종목]</code> 거래 · <code>/pnl [today|week|month|all]</code> 손익',
   '<code>/note &lt;ID&gt; &lt;메모&gt;</code> · <code>/deltrade &lt;ID&gt;</code> · <code>/export</code> CSV · <code>/sync</code> Binance 동기화',
+  '<code>/rules</code> 매매 규칙 위반 · <code>/digest on|off</code> 장 마감 요약 (<code>/digest krx</code>로 지금 받기)',
+  '<code>/import_tv</code> TradingView watchlist 가져오기 (TV 쿠키 필요)',
   '',
   '명령어 대신 문장으로도 됩니다. 예: "하이닉스 4% 움직이면 알려줘", "삼성전자 19만원 깨지면 알려줘". 실행 전에 확인 버튼이 나옵니다.',
   '<code>/status</code> — 시세 연결 상태, 종목별 마지막 quote·측정 지연',
@@ -661,6 +670,95 @@ export function registerCommands(bot: Bot, d: BotDeps): Actions {
     } catch (e) {
       await ctx.reply(`동기화 실패: ${esc((e as Error).message)}`, html);
     }
+  });
+
+  bot.command('rules', async (ctx) => {
+    const kstMidnight = (d: string) => new Date(`${d}T00:00:00+09:00`).toISOString();
+    const sum = d.rules.summary(kstMidnight(periodStart('week')), kstMidnight(periodStart('month')));
+    const rules = Object.keys(RULE_LABEL) as RuleName[];
+    const lim = d.cfg.trading_rules;
+    const limits: Record<RuleName, string> = {
+      max_trades_per_day: `하루 ${lim.max_trades_per_day}회`,
+      max_loss_R: `-${lim.max_loss_R}R`,
+      require_stop_loss: lim.require_stop_loss ? '켜짐' : '꺼짐',
+    };
+    const lines = rules.map((r) => `${RULE_LABEL[r]} (${limits[r]}): 이번 주 ${sum.week.get(r) ?? 0} · 이번 달 ${sum.month.get(r) ?? 0}`);
+    const recent = sum.recent.map(
+      (v) => `• ${fmtKst(new Date(v.occurred_at))} ${esc(nameOf(v.symbol))} ${RULE_LABEL[v.rule as RuleName] ?? esc(v.rule)} — ${esc(v.detail)}`,
+    );
+    await ctx.reply(`<b>매매 규칙</b>\n${lines.join('\n')}${recent.length ? `\n\n<b>최근 위반</b>\n${recent.join('\n')}` : ''}`, html);
+  });
+
+  bot.command('digest', async (ctx) => {
+    const arg = ctx.match.trim().toLowerCase();
+    if (arg === 'on' || arg === 'off') {
+      d.digest.setEnabled(arg === 'on');
+      return void (await ctx.reply(`장 마감 요약을 ${arg === 'on' ? '켰습니다' : '껐습니다'}.`));
+    }
+    if (arg === 'krx' || arg === 'us' || arg === 'crypto') {
+      await ctx.replyWithChatAction('typing').catch(() => undefined);
+      const reason = await d.digest.run(arg as DigestMarket, true);
+      if (reason) await ctx.reply(`보낼 요약이 없습니다: ${esc(reason)}`, html);
+      return;
+    }
+    const t = d.cfg.digest;
+    await ctx.reply(
+      `장 마감 요약: ${d.digest.enabled() ? '켜짐' : '꺼짐'}\nKRX ${t.krx} · 미국 ${t.us} · 크립토 ${t.crypto} (KST)\n` +
+        '<code>/digest on|off</code>, 지금 받기: <code>/digest krx|us|crypto</code>',
+      html,
+    );
+  });
+
+  bot.command('import_tv', async (ctx) => {
+    let lists;
+    try {
+      lists = await d.md.watchlists();
+    } catch (e) {
+      if (e instanceof MarketDataError && e.code === 'NO_CREDENTIALS') {
+        return void (await ctx.reply('TradingView 쿠키(TV_SESSION, TV_SIGNATURE)를 .env에 넣어야 합니다.'));
+      }
+      return void (await ctx.reply(`watchlist를 가져오지 못했습니다: ${esc((e as Error).message)}`, html));
+    }
+    const nonEmpty = lists.filter((l) => l.symbols.length > 0);
+    if (nonEmpty.length === 0) return void (await ctx.reply('TradingView watchlist가 비어 있습니다.'));
+    await ctx.reply('가져올 watchlist를 고르세요. 이미 있는 종목은 건너뜁니다.', {
+      reply_markup: d.choices.keyboard(
+        ctx.chat.id,
+        nonEmpty.map((l) => ({
+          label: `${l.name} (${l.symbols.length})`.slice(0, 60),
+          run: async (c) => {
+            const added: string[] = [];
+            const failed: string[] = [];
+            const existing = new Set(d.repo.listWatch().map((w) => w.symbol));
+            for (const sym of l.symbols.filter((x) => !existing.has(x))) {
+              try {
+                const meta = await d.md.symbolInfo(sym);
+                d.repo.upsertMeta({ symbol: sym, description: meta.description, currency: meta.currency ?? null, timezone: meta.timezone, session: meta.session });
+                d.monitor.setMeta(meta);
+                const mode = d.cfg.defaults.mode;
+                d.repo.addWatch({
+                  symbol: sym,
+                  displayName: d.resolver.displayName(sym) ?? meta.localDescription ?? meta.description,
+                  mode,
+                  threshold: mode === 'sigma' ? d.cfg.defaults.sigma_threshold : d.cfg.defaults.pct_threshold,
+                  volumeEnabled: meta.timezone === 'America/New_York' ? d.cfg.defaults.volume_enabled_us : true,
+                });
+                added.push(sym);
+              } catch {
+                failed.push(sym);
+              }
+            }
+            d.subs.request();
+            void d.history.refreshAll(added);
+            await c.reply(
+              `"${esc(l.name)}" 가져오기: 추가 ${added.length} · 이미 있음 ${l.symbols.length - added.length - failed.length}` +
+                (failed.length ? ` · 실패 ${failed.length} (${failed.map(esc).join(', ')})` : ''),
+              html,
+            );
+          },
+        })),
+      ),
+    });
   });
 
   bot.command('status', async (ctx) => {

@@ -101,3 +101,20 @@ CREATE TABLE IF NOT EXISTS position_stops (
   take_profit REAL,
   updated_at TEXT NOT NULL
 );
+
+-- 매매 규칙 위반 (config.yaml trading_rules)
+CREATE TABLE IF NOT EXISTS rule_violations (
+  id INTEGER PRIMARY KEY,
+  rule TEXT NOT NULL,                  -- max_trades_per_day | max_loss_R | require_stop_loss
+  symbol TEXT NOT NULL,
+  trade_group TEXT,
+  detail TEXT,
+  occurred_at TEXT NOT NULL,
+  UNIQUE (rule, trade_group)
+);
+
+-- 봇 설정 (digest on/off 등)
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);

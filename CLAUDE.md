@@ -18,6 +18,8 @@ Telegram 마켓 알림 봇 + 매매 기록. watchlist와 보유 포지션을 Tra
 ## 명령
 - `npm run dev` 개발 실행 (tsx watch + pino-pretty)
 - `npm test` / `npm run typecheck` / `npm run build`
+- 상시 실행(macOS launchd): `npm run service:install` / `service:restart`(코드 변경 후) / `service:uninstall` / `service:logs`
+  - dev(`npm run dev`)와 서비스를 동시에 띄우면 Telegram polling이 충돌(409)한다. 둘 중 하나만 실행한다.
 
 ## 코딩 규칙
 - TypeScript strict, ESM. 외부 입력(LLM 출력, API 응답, 명령어 인자)은 전부 zod로 검증한다.

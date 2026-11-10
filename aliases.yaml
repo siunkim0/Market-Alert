@@ -1,0 +1,21 @@
+# 종목 별칭 사전. key = TradingView symbol
+# name: 표시 이름, aliases: /add 등에서 인식할 이름 (대소문자·공백 무시)
+"KRX:005930": { name: 삼성전자, aliases: [삼성, 삼전, samsung, 삼성전자보통주] }
+"KRX:005935": { name: 삼성전자우, aliases: [삼성우, 삼전우] }
+"KRX:000660": { name: SK하이닉스, aliases: [하이닉스, 하닉, hynix, skhynix, sk hynix] }
+"KRX:373220": { name: LG에너지솔루션, aliases: [엘지엔솔, 엔솔, lg엔솔] }
+"KRX:207940": { name: 삼성바이오로직스, aliases: [삼바, 삼성바이오] }
+"KRX:005380": { name: 현대차, aliases: [현대자동차] }
+"KRX:035420": { name: NAVER, aliases: [네이버] }
+"KRX:035720": { name: 카카오, aliases: [kakao] }
+"KRX:KOSPI": { name: KOSPI, aliases: [코스피] }
+"KRX:KOSDAQ": { name: KOSDAQ, aliases: [코스닥] }
+"NASDAQ:AAPL": { name: Apple, aliases: [애플] }
+"NASDAQ:NVDA": { name: NVIDIA, aliases: [엔비디아] }
+"NASDAQ:TSLA": { name: Tesla, aliases: [테슬라] }
+"NASDAQ:MSFT": { name: Microsoft, aliases: [마이크로소프트, 마소] }
+"NASDAQ:NDX": { name: NASDAQ 100, aliases: [나스닥100, 나스닥] }
+"AMEX:SPY": { name: SPY, aliases: [s&p500, 에스앤피] }
+"BINANCE:BTCUSDT": { name: BTC, aliases: [비트코인, bitcoin, btc] }
+"BINANCE:ETHUSDT": { name: ETH, aliases: [이더리움, ethereum, eth] }
+"BINANCE:BTCUSDC.P": { name: BTC 무기한, aliases: [btc선물, 비트선물] }

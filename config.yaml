@@ -1,0 +1,31 @@
+defaults:
+  mode: sigma            # sigma | pct
+  sigma_threshold: 3.0
+  pct_threshold: 5.0
+  sigma_window: 20       # 거래일
+  volume_ratio: 3.0
+  volume_enabled_us: true    # quote 거래량 = 일봉 거래량 (전체 시장 기준) 확인됨
+escalation:
+  sigma_steps: [3, 4, 5, 6]
+  pct_step: 2.5          # 5 → 7.5 → 10 ...
+level_default_proximity_pct: 2.0
+delay:
+  lag_threshold_sec: 60
+  lag_persist_min: 5
+benchmarks:              # 시장 전체 판단용 지수
+  KRX: KRX:KOSPI
+  US: NASDAQ:NDX
+  CRYPTO: BINANCE:BTCUSDT
+digest:
+  krx: "16:00"           # 20분 지연 반영
+  us: "06:30"            # 다음 날 KST
+  crypto: "09:05"        # UTC 00:00 일봉 마감 직후
+daily_bars_refresh:      # 일봉 갱신 시각 (KST, 각 시장 개장 전)
+  - "08:30"              # KRX
+  - "09:01"              # 크립토 (UTC 00:00 일봉 마감 직후)
+  - "21:30"              # 미국 (서머타임 22:30 / 표준시 23:30 개장 전)
+journal_sync_minutes: 10
+trading_rules:           # 위반 시 경고
+  max_trades_per_day: 2
+  max_loss_R: 1.0
+  require_stop_loss: true

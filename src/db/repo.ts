@@ -63,6 +63,46 @@ export interface AlertLogRow {
 
 export type NewAlertLog = Omit<AlertLogRow, 'id' | 'created_at' | 'telegram_message_id'>;
 
+export interface TradeRow {
+  id: number;
+  source: string;
+  external_id: string | null;
+  symbol: string;
+  side: 'buy' | 'sell';
+  qty: number;
+  price: number;
+  fee: number | null;
+  fee_currency: string | null;
+  leverage: number | null;
+  executed_at: string;
+  trade_group: string | null;
+  stop_loss: number | null;
+  take_profit: number | null;
+  note: string | null;
+  realized_pnl: number | null;
+  created_at: string;
+}
+
+export type NewTrade = Omit<TradeRow, 'id' | 'created_at' | 'trade_group'>;
+
+export interface PositionStopRow {
+  trade_group: string;
+  symbol: string;
+  initial_stop: number | null;
+  stop_loss: number | null;
+  take_profit: number | null;
+  updated_at: string;
+}
+
+export interface PositionSnapshotRow {
+  source: string;
+  symbol: string;
+  qty: number;
+  avg_price: number;
+  unrealized_pnl: number | null;
+  fetched_at: string;
+}
+
 export interface BarRow {
   symbol: string;
   date: string;
@@ -195,6 +235,103 @@ export class Repo {
     return !!this.db
       .prepare("SELECT 1 FROM alert_log WHERE level_id = ? AND trigger_type = 'level' AND direction = 'near' LIMIT 1")
       .get(levelId);
+  }
+
+  // ── trades ─────────────────────────────────────────────────
+  /** (source, external_id) 중복이면 null */
+  insertTrade(t: NewTrade): number | null {
+    const r = this.db
+      .prepare(
+        `INSERT INTO trades (source, external_id, symbol, side, qty, price, fee, fee_currency, leverage, executed_at,
+           stop_loss, take_profit, note, realized_pnl, created_at)
+         VALUES (@source, @external_id, @symbol, @side, @qty, @price, @fee, @fee_currency, @leverage, @executed_at,
+           @stop_loss, @take_profit, @note, @realized_pnl, @created_at)
+         ON CONFLICT(source, external_id) DO NOTHING`,
+      )
+      .run({ ...t, created_at: nowIso() });
+    return r.changes > 0 ? Number(r.lastInsertRowid) : null;
+  }
+
+  listTrades(): TradeRow[] {
+    return this.db.prepare('SELECT * FROM trades ORDER BY executed_at, id').all() as TradeRow[];
+  }
+
+  getTrade(id: number): TradeRow | undefined {
+    return this.db.prepare('SELECT * FROM trades WHERE id = ?').get(id) as TradeRow | undefined;
+  }
+
+  deleteTrade(id: number): boolean {
+    return this.db.prepare("DELETE FROM trades WHERE id = ? AND source = 'manual'").run(id).changes > 0;
+  }
+
+  updateTradeGroups(map: Map<number, string>): void {
+    const stmt = this.db.prepare('UPDATE trades SET trade_group = ? WHERE id = ? AND (trade_group IS NOT ? )');
+    this.db.transaction(() => {
+      for (const [id, g] of map) stmt.run(g, id, g);
+    })();
+  }
+
+  setTradeNote(id: number, note: string): boolean {
+    return this.db.prepare('UPDATE trades SET note = ? WHERE id = ?').run(note, id).changes > 0;
+  }
+
+  // ── position_stops ─────────────────────────────────────────
+  listPositionStops(): PositionStopRow[] {
+    return this.db.prepare('SELECT * FROM position_stops').all() as PositionStopRow[];
+  }
+
+  setPositionStop(group: string, symbol: string, kind: 'sl' | 'tp', price: number, initialIfUnset: number | null): void {
+    const cur = this.db.prepare('SELECT * FROM position_stops WHERE trade_group = ?').get(group) as PositionStopRow | undefined;
+    const row: PositionStopRow = cur ?? { trade_group: group, symbol, initial_stop: null, stop_loss: null, take_profit: null, updated_at: '' };
+    if (kind === 'sl') {
+      row.stop_loss = price;
+      row.initial_stop ??= initialIfUnset ?? price;
+    } else row.take_profit = price;
+    row.updated_at = nowIso();
+    this.db
+      .prepare(
+        `INSERT INTO position_stops (trade_group, symbol, initial_stop, stop_loss, take_profit, updated_at)
+         VALUES (@trade_group, @symbol, @initial_stop, @stop_loss, @take_profit, @updated_at)
+         ON CONFLICT(trade_group) DO UPDATE SET initial_stop = excluded.initial_stop, stop_loss = excluded.stop_loss,
+           take_profit = excluded.take_profit, updated_at = excluded.updated_at`,
+      )
+      .run(row);
+  }
+
+  // ── positions_snapshot / sync_state ────────────────────────
+  replacePositionSnapshot(source: string, rows: Omit<PositionSnapshotRow, 'source' | 'fetched_at'>[]): void {
+    const at = nowIso();
+    this.db.transaction(() => {
+      this.db.prepare('DELETE FROM positions_snapshot WHERE source = ?').run(source);
+      const stmt = this.db.prepare(
+        `INSERT INTO positions_snapshot (source, symbol, qty, avg_price, unrealized_pnl, fetched_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      );
+      for (const r of rows) stmt.run(source, r.symbol, r.qty, r.avg_price, r.unrealized_pnl, at);
+    })();
+  }
+
+  listPositionSnapshot(source?: string): PositionSnapshotRow[] {
+    return (
+      source
+        ? this.db.prepare('SELECT * FROM positions_snapshot WHERE source = ?').all(source)
+        : this.db.prepare('SELECT * FROM positions_snapshot').all()
+    ) as PositionSnapshotRow[];
+  }
+
+  getSyncState(source: string): { last_synced_at: string | null; cursor: string | null } | undefined {
+    return this.db.prepare('SELECT last_synced_at, cursor FROM sync_state WHERE source = ?').get(source) as
+      | { last_synced_at: string | null; cursor: string | null }
+      | undefined;
+  }
+
+  setSyncState(source: string, cursor: string | null): void {
+    this.db
+      .prepare(
+        `INSERT INTO sync_state (source, last_synced_at, cursor) VALUES (?, ?, ?)
+         ON CONFLICT(source) DO UPDATE SET last_synced_at = excluded.last_synced_at, cursor = excluded.cursor`,
+      )
+      .run(source, nowIso(), cursor);
   }
 
   // ── symbol_meta ────────────────────────────────────────────

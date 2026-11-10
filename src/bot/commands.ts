@@ -10,6 +10,12 @@ import type { SubscriptionManager } from '../market/subscriptions.js';
 import type { SymbolResolver } from '../market/symbols.js';
 import type { TriggerEngine } from '../triggers/engine.js';
 import type { Explainer } from '../agent/explain.js';
+import type { Journal } from '../journal/journal.js';
+import { periodStats, type Period } from '../journal/pnl.js';
+import { InputFile } from 'grammy';
+import {
+  formatHistory, formatPnl, formatPositions, formatRecorded, positionMismatches, tradesCsv,
+} from './journalFormat.js';
 import { fmtLevel } from '../triggers/engine.js';
 import { fmtKst } from '../time.js';
 import type { Choices } from './confirm.js';
@@ -27,6 +33,8 @@ export interface Actions {
   /** ms=0이면 해제 */
   mute(ctx: Context, query: string, ms: number): Promise<void>;
   why(ctx: Context, query: string): Promise<void>;
+  trade(ctx: Context, side: 'buy' | 'sell', args: TradeArgs): Promise<void>;
+  stop(ctx: Context, query: string, kind: 'sl' | 'tp', price: number): Promise<void>;
 }
 
 export interface BotDeps {
@@ -40,6 +48,9 @@ export interface BotDeps {
   choices: Choices;
   engine: TriggerEngine;
   explainer: Explainer;
+  journal: Journal;
+  /** Binance 동기화 (키가 없으면 undefined) */
+  syncer?: { sync(): Promise<{ inserted: number; symbols: string[] }> } | undefined;
   logger: Logger;
 }
 
@@ -53,6 +64,17 @@ export const COMMANDS: { command: string; description: string }[] = [
   { command: 'unlevel', description: '레벨 알림 삭제: /unlevel <id>' },
   { command: 'mute', description: '음소거: /mute <종목> <2h|30m|1d|off>' },
   { command: 'why', description: '지금 움직임의 원인 요약: /why <종목>' },
+  { command: 'buy', description: '매수 기록: /buy <종목> <수량> <가격> [sl=] [tp=] [메모]' },
+  { command: 'sell', description: '매도 기록: /sell <종목> <수량> <가격> [메모]' },
+  { command: 'sl', description: '손절가: /sl <종목> <가격>' },
+  { command: 'tp', description: '익절가: /tp <종목> <가격>' },
+  { command: 'pos', description: '현재 포지션과 미실현손익' },
+  { command: 'history', description: '최근 거래: /history [n|종목]' },
+  { command: 'pnl', description: '실현손익: /pnl [today|week|month|all]' },
+  { command: 'note', description: '복기 메모: /note <거래ID> <메모>' },
+  { command: 'deltrade', description: '수동 기록 삭제: /deltrade <기록ID>' },
+  { command: 'export', description: '매매 기록 CSV' },
+  { command: 'sync', description: 'Binance 체결 즉시 동기화' },
   { command: 'status', description: '시세 연결·지연 상태' },
   { command: 'help', description: '사용법' },
 ];
@@ -69,6 +91,12 @@ const HELP = [
   '<code>/levels</code>, <code>/unlevel &lt;id&gt;</code> — 레벨 알림 목록·삭제',
   '<code>/mute &lt;종목&gt; &lt;2h|30m|1d|off&gt;</code> — 일시 음소거',
   '<code>/why &lt;종목&gt;</code> — 지금 움직임의 원인 요약 (뉴스 + AI)',
+  '',
+  '<b>매매 기록</b>',
+  '<code>/buy &lt;종목&gt; &lt;수량&gt; &lt;가격&gt; [sl=가격] [tp=가격] [fee=수수료] [메모]</code>, <code>/sell …</code>',
+  '<code>/sl &lt;종목&gt; &lt;가격&gt;</code>, <code>/tp &lt;종목&gt; &lt;가격&gt;</code> — 보유 포지션 손절·익절가 (근접·도달 알림)',
+  '<code>/pos</code> 포지션 · <code>/history [n|종목]</code> 거래 · <code>/pnl [today|week|month|all]</code> 손익',
+  '<code>/note &lt;ID&gt; &lt;메모&gt;</code> · <code>/deltrade &lt;ID&gt;</code> · <code>/export</code> CSV · <code>/sync</code> Binance 동기화',
   '',
   '명령어 대신 문장으로도 됩니다. 예: "하이닉스 4% 움직이면 알려줘", "삼성전자 19만원 깨지면 알려줘". 실행 전에 확인 버튼이 나옵니다.',
   '<code>/status</code> — 시세 연결 상태, 종목별 마지막 quote·측정 지연',
@@ -147,6 +175,51 @@ export function parseLevelArgs(text: string): LevelArgs | { error: string } {
     rest = rest.slice(1);
   }
   return { query: tokens.slice(0, pi).join(' '), price: price.data, proximityPct, note: rest.join(' ') || undefined };
+}
+
+export interface TradeArgs {
+  query: string;
+  qty: number;
+  price: number;
+  stopLoss: number | undefined;
+  takeProfit: number | undefined;
+  fee: number | undefined;
+  note: string | undefined;
+}
+
+const NUM_RE = /^\d[\d,]*(\.\d+)?$/;
+const num = (t: string) => Number(t.replace(/,/g, ''));
+
+/**
+ * '/buy SK 하이닉스 10 210,000 sl=190000 tp=250000 눌림 매수'
+ * 종목 다음 첫 숫자가 수량, 다음 숫자가 가격('@' 무시). key=value(sl, tp, fee) 외 나머지는 메모.
+ */
+export function parseTradeArgs(text: string): TradeArgs | { error: string } {
+  const tokens = text.trim().split(/\s+/).filter((t) => t && t !== '@');
+  const qi = tokens.findIndex((t, i) => i > 0 && NUM_RE.test(t));
+  if (qi < 1 || !tokens[qi + 1] || !NUM_RE.test(tokens[qi + 1]!.replace(/^@/, ''))) {
+    return { error: '형식: <code>/buy &lt;종목&gt; &lt;수량&gt; &lt;가격&gt; [sl=가격] [tp=가격] [메모]</code>' };
+  }
+  const qty = num(tokens[qi]!);
+  const price = num(tokens[qi + 1]!.replace(/^@/, ''));
+  if (!(qty > 0) || !(price > 0)) return { error: '수량과 가격은 0보다 커야 합니다.' };
+  const out: TradeArgs = { query: tokens.slice(0, qi).join(' '), qty, price, stopLoss: undefined, takeProfit: undefined, fee: undefined, note: undefined };
+  const memo: string[] = [];
+  for (const t of tokens.slice(qi + 2)) {
+    const m = /^(sl|tp|fee|손절|익절|수수료)=([\d,.]+)$/i.exec(t);
+    if (!m) {
+      memo.push(t);
+      continue;
+    }
+    const v = num(m[2]!);
+    if (!(v >= 0) || Number.isNaN(v)) return { error: `값이 올바르지 않습니다: ${t}` };
+    const k = m[1]!.toLowerCase();
+    if (k === 'sl' || k === '손절') out.stopLoss = v;
+    else if (k === 'tp' || k === '익절') out.takeProfit = v;
+    else out.fee = v;
+  }
+  out.note = memo.join(' ') || undefined;
+  return out;
 }
 
 // ── 핸들러 ──────────────────────────────────────────────────
@@ -334,7 +407,67 @@ export function registerCommands(bot: Bot, d: BotDeps): Actions {
     },
 
     why: (ctx, q) => resolveOrAsk(ctx, q, (c, sym, name) => why(c, sym, name)),
+
+    trade: (ctx, side, a) => {
+      // 보유 종목이면 그 종목으로 (매도 시 검색 생략)
+      const held = findPosition(a.query);
+      if (held) return recordTrade(ctx, held, side, a);
+      return resolveOrAsk(ctx, a.query, (c, sym) => recordTrade(c, sym, side, a));
+    },
+
+    async stop(ctx, q, kind, price) {
+      const sym = findPosition(q);
+      if (!sym) return void (await ctx.reply(`보유 포지션이 없습니다: ${esc(q)}\n<code>/pos</code>로 확인하세요.`, html));
+      const p = d.journal.setStop(sym, kind, price);
+      if (!p) return void (await ctx.reply('보유 포지션이 없습니다.'));
+      const cur = d.monitor.snapshot(sym).quote?.price;
+      const wrongSide =
+        cur !== undefined && ((kind === 'sl') === p.qty > 0 ? price >= cur : price <= cur)
+          ? `\n⚠️ 현재가 ${fmtPrice(cur)} 기준으로 이미 ${kind === 'sl' ? '손절' : '익절'}가를 넘었습니다.`
+          : '';
+      await ctx.reply(
+        `${esc(nameOf(sym))} ${kind === 'sl' ? '손절' : '익절'}가 ${fmtPrice(price)} 설정 (거래 ${p.group.id})` +
+          (kind === 'sl' && p.group.initialStop !== null && p.group.initialStop !== price ? ` · R 기준 최초 손절가 ${fmtPrice(p.group.initialStop)}` : '') +
+          wrongSide,
+        html,
+      );
+    },
   };
+
+  function nameOf(symbol: string): string {
+    return d.repo.getWatch(symbol)?.display_name ?? d.resolver.displayName(symbol) ?? d.repo.getMeta(symbol)?.description ?? symbol;
+  }
+
+  function findPosition(q: string): string | undefined {
+    return d.journal.openSymbols().find((sym) => d.resolver.matches(q, sym, nameOf(sym)));
+  }
+
+  async function recordTrade(ctx: Context, symbol: string, side: 'buy' | 'sell', a: TradeArgs): Promise<void> {
+    if (!d.repo.getMeta(symbol)) {
+      const meta = await ensureMeta(ctx, symbol, (c) => (c2) => recordTrade(c2, c.symbol, side, a));
+      if (!meta) return;
+    }
+    const before = d.journal.position(symbol);
+    const res = d.journal.record({
+      source: 'manual',
+      symbol,
+      side,
+      qty: a.qty,
+      price: a.price,
+      fee: a.fee,
+      stopLoss: a.stopLoss,
+      takeProfit: a.takeProfit,
+      note: a.note,
+    });
+    if (!res) return void (await ctx.reply('기록하지 못했습니다 (중복).'));
+    if (d.repo.getBars(symbol, 1).length === 0) void d.history.refresh(symbol).catch(() => 0);
+    const opensShort = side === 'sell' && (!before || before.qty < 0);
+    const warn = opensShort ? '\n⚠️ 보유 수량이 없어 숏 포지션으로 기록했습니다. 잘못이면 <code>/deltrade ' + res.trade.id + '</code>' : '';
+    await ctx.reply(
+      formatRecorded(res.trade, res.position, res.group, d.journal.tradeRealized(res.trade.id), nameOf) + warn,
+      html,
+    );
+  }
 
   /** /why: trigger 없이 지금 움직임의 원인 요약 */
   async function why(ctx: Context, symbol: string, aliasName: string | undefined): Promise<void> {
@@ -436,6 +569,98 @@ export function registerCommands(bot: Bot, d: BotDeps): Actions {
     const q = ctx.match.trim();
     if (!q) return void (await ctx.reply('형식: <code>/why &lt;종목&gt;</code>', html));
     await actions.why(ctx, q);
+  });
+
+  for (const side of ['buy', 'sell'] as const) {
+    bot.command(side, async (ctx) => {
+      const a = parseTradeArgs(ctx.match);
+      if ('error' in a) return void (await ctx.reply(a.error.replace('/buy', `/${side}`), html));
+      await actions.trade(ctx, side, a);
+    });
+  }
+
+  for (const kind of ['sl', 'tp'] as const) {
+    bot.command(kind, async (ctx) => {
+      const tokens = ctx.match.trim().split(/\s+/).filter(Boolean);
+      const price = PriceSchema.safeParse((tokens.at(-1) ?? '').replace(/,/g, ''));
+      if (tokens.length < 2 || !price.success) {
+        return void (await ctx.reply(`형식: <code>/${kind} &lt;종목&gt; &lt;가격&gt;</code>`, html));
+      }
+      await actions.stop(ctx, tokens.slice(0, -1).join(' '), kind, price.data);
+    });
+  }
+
+  bot.command('pos', async (ctx) => {
+    const positions = d.journal.openPositions();
+    const views = positions.map((p) => ({ position: p, snap: d.monitor.snapshot(p.symbol) }));
+    const mismatches = positionMismatches(positions, d.repo.listPositionSnapshot('binance_futures'), (s) => /^BINANCE:.+\.P$/.test(s));
+    await ctx.reply(formatPositions(views, d.syncer ? mismatches : [], nameOf), { ...html, link_preview_options: { is_disabled: true } });
+  });
+
+  bot.command('history', async (ctx) => {
+    const arg = ctx.match.trim();
+    let groups = d.journal.groups();
+    let n = 10;
+    if (/^\d+$/.test(arg)) n = Math.min(50, Number(arg));
+    else if (arg) groups = groups.filter((g) => d.resolver.matches(arg, g.symbol, nameOf(g.symbol)));
+    await ctx.reply(formatHistory(groups.slice(0, n), nameOf), html);
+  });
+
+  bot.command('pnl', async (ctx) => {
+    const arg = (ctx.match.trim().toLowerCase() || 'today') as Period;
+    const period: Period = (['today', 'week', 'month', 'all'] as const).includes(arg) ? arg : 'today';
+    const currencyOf = (sym: string) => d.repo.getMeta(sym)?.currency ?? '?';
+    await ctx.reply(formatPnl(periodStats(d.journal.groups(), period, currencyOf), period, nameOf), html);
+  });
+
+  bot.command('note', async (ctx) => {
+    const m = /^#?(G?)(\d+)\s+([\s\S]+)$/i.exec(ctx.match.trim());
+    if (!m) return void (await ctx.reply('형식: <code>/note &lt;기록ID 또는 G거래ID&gt; &lt;메모&gt;</code>', html));
+    const id = Number(m[2]);
+    // G12 → 그 거래의 첫 체결(#12)에 메모
+    if (!d.journal.setNote(id, m[3]!.trim())) return void (await ctx.reply(`기록 #${id}이 없습니다.`));
+    await ctx.reply(`#${id}에 메모를 남겼습니다.`);
+  });
+
+  bot.command('deltrade', async (ctx) => {
+    const id = z.coerce.number().int().positive().safeParse(ctx.match.trim().replace(/^#/, ''));
+    if (!id.success) return void (await ctx.reply('형식: <code>/deltrade &lt;기록ID&gt;</code>', html));
+    const t = d.repo.getTrade(id.data);
+    if (!t) return void (await ctx.reply(`기록 #${id.data}이 없습니다.`));
+    if (t.source !== 'manual') return void (await ctx.reply('거래소에서 가져온 기록은 지울 수 없습니다.'));
+    await ctx.reply(
+      `기록 #${t.id}: ${esc(nameOf(t.symbol))} ${t.side === 'buy' ? '매수' : '매도'} ${t.qty} @ ${fmtPrice(t.price)} 을(를) 삭제할까요?`,
+      {
+        ...html,
+        reply_markup: d.choices.keyboard(ctx.chat.id, [
+          {
+            label: '삭제',
+            run: async (c) => {
+              d.journal.deleteManual(t.id);
+              await c.reply(`기록 #${t.id}을 삭제했습니다.`);
+            },
+          },
+        ]),
+      },
+    );
+  });
+
+  bot.command('export', async (ctx) => {
+    const trades = d.repo.listTrades();
+    if (trades.length === 0) return void (await ctx.reply('기록이 없습니다.'));
+    const name = `trades_${new Date().toISOString().slice(0, 10)}.csv`;
+    await ctx.replyWithDocument(new InputFile(Buffer.from(tradesCsv(trades), 'utf8'), name), { caption: `체결 ${trades.length}건` });
+  });
+
+  bot.command('sync', async (ctx) => {
+    if (!d.syncer) return void (await ctx.reply('Binance 조회용 키(BINANCE_API_KEY/SECRET)가 없습니다.'));
+    await ctx.replyWithChatAction('typing').catch(() => undefined);
+    try {
+      const r = await d.syncer.sync();
+      await ctx.reply(`동기화 완료: 새 체결 ${r.inserted}건${r.symbols.length ? ` (${r.symbols.map(esc).join(', ')})` : ''}`, html);
+    } catch (e) {
+      await ctx.reply(`동기화 실패: ${esc((e as Error).message)}`, html);
+    }
   });
 
   bot.command('status', async (ctx) => {

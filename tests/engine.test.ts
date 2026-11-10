@@ -4,7 +4,7 @@ import { createLogger } from '../src/logger.js';
 import { HistoryService } from '../src/market/history.js';
 import type { Bar } from '../src/market/marketData.js';
 import { MarketMonitor } from '../src/market/monitor.js';
-import { TriggerEngine, type AlertEvent, type AlertSink } from '../src/triggers/engine.js';
+import { TriggerEngine, hitLabel, type AlertEvent, type AlertSink } from '../src/triggers/engine.js';
 import { evaluateLevel } from '../src/triggers/rules.js';
 import { FakeMarketData, makeQuote } from './fakes/fakeMarketData.js';
 
@@ -17,9 +17,7 @@ class MemorySink implements AlertSink {
     this.events.push(...evs);
   }
   labels() {
-    return this.events.map((e) =>
-      e.hit.type === 'level' ? `level:${e.hit.phase}` : `${e.hit.type}:${e.hit.direction}:${e.hit.level}${e.startup ? '*' : ''}`,
-    );
+    return this.events.map((e) => `${hitLabel(e.hit)}${e.startup && e.hit.type !== 'level' && e.hit.type !== 'position' ? '*' : ''}`);
   }
 }
 
@@ -34,7 +32,7 @@ function bars(): Bar[] {
   return out;
 }
 
-async function setup(repo: Repo) {
+async function setup(repo: Repo, positionOf?: (s: string) => import('../src/triggers/engine.js').HeldPosition | undefined) {
   const md = new FakeMarketData();
   md.bars.set(SYM, bars());
   md.metas.set(SYM, { symbol: SYM, description: 'BTC', localDescription: undefined, currency: 'USDT', timezone: 'Etc/UTC', session: '24x7', type: 'spot' });
@@ -48,6 +46,8 @@ async function setup(repo: Repo) {
     rules: { esc: { sigmaSteps: [3, 4, 5, 6], pctStep: 2.5, pctBase: 5 }, volumeRatio: 3, volumeWarmupMin: 30, levelDefaultProximityPct: 2 },
     benchmarks: {},
     nameOf: (s) => s,
+    positionOf,
+    defaultWatch: { mode: 'sigma', threshold: 3 },
   });
   engine.start();
   engine.stop(); // prune 타이머만 끈다 (listener는 유지)
@@ -118,6 +118,29 @@ describe('TriggerEngine (FakeMarketData 재생)', () => {
     a.feed(1.2);
     expect(a.sink.labels()).toEqual(['level:near', 'level:reach']);
     expect(repo.getLevel(id)?.active).toBe(0);
+  });
+
+  it('보유 포지션: watchlist에 없어도 감시, 손절 근접·도달 1회씩, 재시작 후 유지', async () => {
+    repo = new Repo(':memory:');
+    const { Journal } = await import('../src/journal/journal.js');
+    const j = new Journal(repo, logger);
+    j.record({ source: 'manual', symbol: SYM, side: 'buy', qty: 1, price: 100, stopLoss: 99, takeProfit: 105 });
+    const a = await setup(repo, (s) => j.position(s));
+    a.feed(0.5); // 100.5: 손절까지 1.49% → 근접 (기본 2%)
+    a.feed(0.4); // 반복 없음
+    a.feed(-1.2); // 98.8 → 손절 도달
+    a.feed(-1.5);
+    expect(a.sink.labels()).toEqual(['position:sl_near', 'position:sl_reach']);
+    expect(a.sink.events[0]!.position).toMatchObject({ qty: 1, avgPrice: 100 });
+    expect(a.sink.events[0]!.position!.stopDistancePct).toBeCloseTo((100.5 - 99) / 100.5 * 100, 8);
+
+    const b = await setup(repo, (s) => j.position(s));
+    b.feed(-1.3);
+    expect(b.sink.labels()).toEqual([]);
+    // 손절가를 옮기면 새 목표로 다시 알림
+    j.setStop(SYM, 'sl', 98);
+    b.feed(-1.4); // 98.6: 98까지 0.6% → 근접
+    expect(b.sink.labels()).toEqual(['position:sl_near']);
   });
 
   it('evaluateLevel below', () => {

@@ -6,7 +6,23 @@ import type { Repo, LevelRow, NewAlertLog, WatchRow } from '../db/repo.js';
 import type { Logger } from '../logger.js';
 import type { MarketMonitor, Snapshot } from '../market/monitor.js';
 import { Cooldown, cooldownKey, type EscalationConfig } from './cooldown.js';
-import { evaluateLevel, evaluateWatch, type RuleConfig, type RuleHit } from './rules.js';
+import { evaluateLevel, evaluatePosition, evaluateWatch, type RuleConfig, type RuleHit } from './rules.js';
+import type { WatchMode } from '../db/repo.js';
+
+export interface HeldPosition {
+  qty: number;
+  avgPrice: number;
+  group: { id: string; currentStop: number | null; currentTarget: number | null };
+}
+
+export interface PositionInfo {
+  qty: number;
+  avgPrice: number;
+  unrealized: number;
+  unrealizedPct: number;
+  /** 손절가까지 남은 거리(%) */
+  stopDistancePct: number | null;
+}
 
 export interface BenchmarkInfo {
   symbol: string;
@@ -24,6 +40,7 @@ export interface AlertEvent {
   /** 프로세스가 이 거래일 첫 quote를 받았을 때 이미 넘은 상태였음 (재시작·장 시작 직후) */
   startup: boolean;
   benchmark: BenchmarkInfo | undefined;
+  position: PositionInfo | undefined;
 }
 
 export interface AlertSink {
@@ -39,7 +56,14 @@ export interface EngineDeps {
   /** market → benchmark symbol */
   benchmarks: Record<string, string>;
   nameOf: (symbol: string) => string;
+  /** 보유 포지션 (journal). 보유 종목은 watchlist에 없어도 기본 기준으로 감시한다 */
+  positionOf?: (symbol: string) => HeldPosition | undefined;
+  defaultWatch?: { mode: WatchMode; threshold: number };
   now?: () => Date;
+}
+
+function positionKey(symbol: string, kind: string, phase: string, groupId: string, target: number): string {
+  return cooldownKey(symbol, 'position', `${kind}_${phase}`, `${groupId}:${target}`);
 }
 
 const RESTORE_DAYS = 4;
@@ -63,7 +87,13 @@ export class TriggerEngine {
   /** 재시작 시 오늘 단계 복원 + 레벨 로드 + monitor 구독 */
   start(): void {
     const since = new Date(this.now().getTime() - RESTORE_DAYS * 86_400_000).toISOString();
-    const n = this.cooldown.restore(this.d.repo.alertsSince(since));
+    const rows = this.d.repo.alertsSince(since);
+    let n = this.cooldown.restore(rows);
+    for (const r of rows) {
+      if (r.trigger_type !== 'position' || !r.direction || r.level_reached === null || r.level_id === null) continue;
+      const [kind, phase] = r.direction.split('_');
+      if (this.cooldown.tryFire(positionKey(r.symbol, kind!, phase!, `G${r.level_id}`, r.level_reached), 1)) n++;
+    }
     this.log.info({ restored: n }, 'cooldown 단계 복원');
     this.reloadLevels();
     this.d.monitor.addListener((s) => this.onSnapshot(s));
@@ -109,9 +139,17 @@ export class TriggerEngine {
   onSnapshot(s: Snapshot): void {
     const q = s.quote;
     if (!q || !s.sessionDate) return;
-    const w = this.d.repo.getWatch(s.symbol);
+    const pos = this.d.positionOf?.(s.symbol);
+    const w =
+      this.d.repo.getWatch(s.symbol) ??
+      (pos && this.d.defaultWatch
+        ? {
+            id: -1, symbol: s.symbol, display_name: null, mode: this.d.defaultWatch.mode,
+            threshold: this.d.defaultWatch.threshold, volume_enabled: 0, muted_until: null, created_at: '',
+          }
+        : undefined);
     const levels = this.levels.get(s.symbol) ?? [];
-    if (!w && levels.length === 0) return;
+    if (!w && levels.length === 0 && !pos) return;
     if (!s.marketOpen) return;
 
     const now = this.now();
@@ -125,7 +163,7 @@ export class TriggerEngine {
 
     if (w) {
       for (const hit of evaluateWatch(w, s, this.d.rules)) {
-        if (hit.type === 'level') continue;
+        if (hit.type === 'level' || hit.type === 'position') continue;
         const key = cooldownKey(s.symbol, hit.type, hit.direction, s.sessionDate);
         if (this.cooldown.tryFire(key, hit.level)) fired.push(hit);
       }
@@ -150,6 +188,13 @@ export class TriggerEngine {
       fired.push(hit);
     }
 
+    if (pos) {
+      for (const hit of evaluatePosition(pos, q.price, this.d.rules.levelDefaultProximityPct)) {
+        if (hit.type !== 'position') continue;
+        if (this.cooldown.tryFire(positionKey(s.symbol, hit.kind, hit.phase, hit.groupId, hit.target), 1)) fired.push(hit);
+      }
+    }
+
     if (fired.length === 0) return;
 
     const bench = this.benchmarkFor(s);
@@ -161,9 +206,10 @@ export class TriggerEngine {
       snapshot: s,
       startup,
       benchmark: bench,
+      position: pos ? positionInfo(pos, q.price) : undefined,
     }));
     this.log.info(
-      { symbol: s.symbol, hits: fired.map((h) => (h.type === 'level' ? `level:${h.phase}` : `${h.type}:${h.direction}:${h.level}`)), startup },
+      { symbol: s.symbol, hits: fired.map(hitLabel), startup },
       '알림 발생',
     );
     this.d.sink.deliver(s.symbol, events).catch((e: Error) => this.log.error({ err: e.message }, '알림 전송 실패'));
@@ -192,8 +238,31 @@ export class TriggerEngine {
     if (hit.type === 'level') {
       return { ...base, direction: hit.phase, level_reached: hit.level.price, level_id: hit.level.id };
     }
+    if (hit.type === 'position') {
+      // level_id에 거래 그룹 번호(G<id>의 id)를 넣어 재시작 시 복원한다
+      return { ...base, direction: `${hit.kind}_${hit.phase}`, level_reached: hit.target, level_id: Number(hit.groupId.slice(1)) };
+    }
     return { ...base, direction: hit.direction, level_reached: hit.level, level_id: null };
   }
+}
+
+export function hitLabel(h: RuleHit): string {
+  if (h.type === 'level') return `level:${h.phase}`;
+  if (h.type === 'position') return `position:${h.kind}_${h.phase}`;
+  return `${h.type}:${h.direction}:${h.level}`;
+}
+
+export function positionInfo(p: HeldPosition, price: number): PositionInfo {
+  const unrealized = (price - p.avgPrice) * p.qty;
+  const sl = p.group.currentStop;
+  const below = p.qty > 0;
+  return {
+    qty: p.qty,
+    avgPrice: p.avgPrice,
+    unrealized,
+    unrealizedPct: ((price / p.avgPrice - 1) * 100) * Math.sign(p.qty),
+    stopDistancePct: sl === null ? null : below ? ((price - sl) / price) * 100 : ((sl - price) / price) * 100,
+  };
 }
 
 export function fmtLevel(v: number): string {

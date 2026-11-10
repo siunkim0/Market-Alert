@@ -98,6 +98,14 @@ export function formatStatus(st: FeedStatus, rows: StatusRow[], now = new Date()
 import type { AlertEvent } from '../triggers/engine.js';
 import { fmtLevel } from '../triggers/engine.js';
 
+export function fmtQty(q: number): string {
+  return q.toLocaleString('en-US', { maximumFractionDigits: 8 });
+}
+
+export function fmtSignedNum(v: number): string {
+  return `${v >= 0 ? '+' : '-'}${fmtPrice(Math.abs(v))}`;
+}
+
 function fmtSigned(v: number, unit: string, digits = 1): string {
   return `${v >= 0 ? '+' : ''}${v.toFixed(digits)}${unit}`;
 }
@@ -122,6 +130,13 @@ export function formatAlertBlock(ev: AlertEvent, now = new Date()): string {
     tail = `다음 알림: ${sign}${fmtLevel(h.next)}${h.type === 'sigma' ? 'σ' : '%'}`;
   } else if (h.type === 'volume') {
     head = `[거래량 Alert] ${name}  거래량 ${h.value.toFixed(1)}x  ${fmtPct(s.r)} · ${fmtZ(s.z)}`;
+  } else if (h.type === 'position') {
+    const label = `${h.kind === 'sl' ? '손절' : '익절'} ${h.phase === 'reach' ? '도달' : '근접'}`;
+    const what = h.kind === 'sl' ? '손절가' : '익절가';
+    head =
+      h.phase === 'reach'
+        ? `[${label}] ${name}  ${what} ${fmtPrice(h.target)} 도달`
+        : `[${label}] ${name}  ${what} ${fmtPrice(h.target)}까지 ${h.distancePct.toFixed(2)}%`;
   } else if (h.type === 'level') {
     const l = h.level;
     const note = l.note ? ` — ${esc(l.note)}` : '';
@@ -144,7 +159,13 @@ export function formatAlertBlock(ev: AlertEvent, now = new Date()): string {
       : undefined,
   ].filter(Boolean);
 
-  return [`${head}${delayTag(s)}${startup}`, info.join(' | '), tail].filter(Boolean).join('\n');
+  const p = ev.position;
+  const held = p
+    ? `보유 중: ${p.qty > 0 ? '' : '숏 '}${fmtQty(Math.abs(p.qty))} @ ${fmtPrice(p.avgPrice)} | 미실현 ${fmtSignedNum(p.unrealized)} (${fmtSigned(p.unrealizedPct, '%', 2)})` +
+      (p.stopDistancePct !== null ? ` | 손절가까지 ${p.stopDistancePct.toFixed(1)}%` : '')
+    : undefined;
+
+  return [`${head}${delayTag(s)}${startup}`, info.join(' | '), held, tail].filter(Boolean).join('\n');
 }
 
 // ── 원인 요약 ────────────────────────────────────────────────

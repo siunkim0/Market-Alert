@@ -91,3 +91,13 @@ CREATE TABLE IF NOT EXISTS sync_state (
 );
 
 CREATE INDEX IF NOT EXISTS idx_alert_log_session ON alert_log (session_date, symbol);
+
+-- /sl, /tp로 바꾼 손절·익절가 (거래 그룹 단위). initial_stop은 R 계산용 최초 손절가
+CREATE TABLE IF NOT EXISTS position_stops (
+  trade_group TEXT PRIMARY KEY,        -- 'G<첫 체결 id>'
+  symbol TEXT NOT NULL,
+  initial_stop REAL,
+  stop_loss REAL,
+  take_profit REAL,
+  updated_at TEXT NOT NULL
+);

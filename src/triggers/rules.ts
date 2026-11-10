@@ -8,7 +8,33 @@ export type Direction = 'up' | 'down';
 export type RuleHit =
   | { type: 'sigma' | 'pct'; direction: Direction; level: number; next: number; value: number }
   | { type: 'volume'; direction: 'up'; level: number; value: number }
-  | { type: 'level'; phase: 'near' | 'reach'; level: LevelRow; distancePct: number };
+  | { type: 'level'; phase: 'near' | 'reach'; level: LevelRow; distancePct: number }
+  | { type: 'position'; kind: 'sl' | 'tp'; phase: 'near' | 'reach'; target: number; distancePct: number; groupId: string };
+
+export interface PositionLike {
+  qty: number;
+  group: { id: string; currentStop: number | null; currentTarget: number | null };
+}
+
+/**
+ * 보유 포지션 손절·익절 근접/도달. 롱: 손절은 아래, 익절은 위. 숏은 반대.
+ * distancePct: 현재가 기준 목표가까지 남은 거리(%, 항상 양수, 도달 시 0 이하)
+ */
+export function evaluatePosition(p: PositionLike, price: number, proximityPct: number): RuleHit[] {
+  const hits: RuleHit[] = [];
+  const long = p.qty > 0;
+  const check = (kind: 'sl' | 'tp', target: number | null) => {
+    if (target === null || !(target > 0)) return;
+    // 목표가가 현재가의 '아래'에 있어야 하는 경우: 롱 손절, 숏 익절
+    const below = (kind === 'sl') === long;
+    const dist = below ? ((price - target) / price) * 100 : ((target - price) / price) * 100;
+    if (dist <= 0) hits.push({ type: 'position', kind, phase: 'reach', target, distancePct: dist, groupId: p.group.id });
+    else if (dist <= proximityPct) hits.push({ type: 'position', kind, phase: 'near', target, distancePct: dist, groupId: p.group.id });
+  };
+  check('sl', p.group.currentStop);
+  check('tp', p.group.currentTarget);
+  return hits;
+}
 
 export interface RuleConfig {
   esc: EscalationConfig;

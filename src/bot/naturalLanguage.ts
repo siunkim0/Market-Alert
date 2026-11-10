@@ -7,7 +7,7 @@ import type { SymbolResolver } from '../market/symbols.js';
 import { fmtLevel } from '../triggers/engine.js';
 import { parseDuration, type Actions } from './commands.js';
 import type { Choices } from './confirm.js';
-import { esc, fmtPrice } from './format.js';
+import { esc, fmtPrice, fmtQty } from './format.js';
 
 export function describeIntent(i: Intent, resolver: SymbolResolver): string {
   const target = (q: string) => {
@@ -34,6 +34,20 @@ export function describeIntent(i: Intent, resolver: SymbolResolver): string {
       return i.args.duration === 'off'
         ? `${target(i.args.symbol_query)} 음소거를 해제할까요?`
         : `${target(i.args.symbol_query)} 알림을 ${esc(i.args.duration)} 동안 끌까요?`;
+    case 'record_trade': {
+      const a = i.args;
+      const extra = [
+        a.stop_loss !== undefined ? `손절 ${fmtPrice(a.stop_loss)}` : '',
+        a.take_profit !== undefined ? `익절 ${fmtPrice(a.take_profit)}` : '',
+      ].filter(Boolean);
+      return (
+        `${target(a.symbol_query)} ${fmtQty(a.qty)} @ ${fmtPrice(a.price)} ${a.side === 'buy' ? '매수' : '매도'}` +
+        `${extra.length ? `, ${extra.join(', ')}` : ''}으로 기록할까요?` +
+        (a.note ? `\n메모: ${esc(a.note)}` : '')
+      );
+    }
+    case 'set_stop':
+      return `${target(i.args.symbol_query)} ${i.args.kind === 'sl' ? '손절' : '익절'}가를 ${fmtPrice(i.args.price)}로 설정할까요?`;
     case 'why':
       return `${target(i.args.symbol_query)} 원인 요약`;
     case 'show_list':
@@ -58,6 +72,18 @@ export function runIntent(i: Intent, ctx: Context, actions: Actions): Promise<vo
       });
     case 'mute':
       return actions.mute(ctx, i.args.symbol_query, parseDuration(i.args.duration) ?? 0);
+    case 'record_trade':
+      return actions.trade(ctx, i.args.side, {
+        query: i.args.symbol_query,
+        qty: i.args.qty,
+        price: i.args.price,
+        stopLoss: i.args.stop_loss,
+        takeProfit: i.args.take_profit,
+        fee: undefined,
+        note: i.args.note,
+      });
+    case 'set_stop':
+      return actions.stop(ctx, i.args.symbol_query, i.args.kind, i.args.price);
     case 'why':
       return actions.why(ctx, i.args.symbol_query);
     case 'show_list':

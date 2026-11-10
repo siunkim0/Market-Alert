@@ -6,6 +6,9 @@ import { AlertEnricher } from './agent/alertEnricher.js';
 import { Explainer } from './agent/explain.js';
 import { GroqClient } from './agent/llm.js';
 import { GoogleNewsRss } from './agent/news.js';
+import { Journal } from './journal/journal.js';
+import { BinanceFuturesImporter } from './journal/importers/binanceFutures.js';
+import { scheduleSync } from './jobs/sync.js';
 import { Choices } from './bot/confirm.js';
 import { loadConfig } from './config.js';
 import { Repo } from './db/repo.js';
@@ -42,6 +45,16 @@ async function main(): Promise<void> {
   const resolver = new SymbolResolver(conf.aliases, md);
   const choices = new Choices(logger);
 
+  const journal = new Journal(repo, logger);
+  // 보유 종목은 watchlist에 없어도 구독
+  subs.addSource(() => journal.openSymbols());
+  journal.onChange(() => subs.request());
+  const syncer =
+    env.BINANCE_API_KEY && env.BINANCE_API_SECRET
+      ? new BinanceFuturesImporter({ apiKey: env.BINANCE_API_KEY, apiSecret: env.BINANCE_API_SECRET }, repo, journal, logger)
+      : undefined;
+  logger.info({ binance: syncer ? 'on' : 'off' }, 'Binance 동기화');
+
   const llm = env.GROQ_API_KEY
     ? new GroqClient(env.GROQ_API_KEY, { fast: env.GROQ_MODEL_FAST, smart: env.GROQ_MODEL_SMART }, logger)
     : undefined;
@@ -66,6 +79,11 @@ async function main(): Promise<void> {
     },
     benchmarks: cfg.benchmarks,
     nameOf: (s) => resolver.displayName(s) ?? repo.getMeta(s)?.description ?? s,
+    positionOf: (s) => journal.position(s),
+    defaultWatch: {
+      mode: cfg.defaults.mode,
+      threshold: cfg.defaults.mode === 'sigma' ? cfg.defaults.sigma_threshold : cfg.defaults.pct_threshold,
+    },
   });
   engine.start();
   subs.addSource(() => engine.levelSymbols());
@@ -94,9 +112,13 @@ async function main(): Promise<void> {
   );
 
   const crons = scheduleDailyBars(cfg.daily_bars_refresh, history, () => subs.desired(), logger);
+  if (syncer) {
+    crons.push(scheduleSync(cfg.journal_sync_minutes, syncer, logger));
+    void syncer.sync().catch((e: Error) => logger.warn({ err: e.message }, '첫 Binance 동기화 실패'));
+  }
 
   const bot = createBot(env.TELEGRAM_BOT_TOKEN, env.TELEGRAM_ALLOWED_CHAT_IDS, {
-    cfg, repo, md, monitor, history, subs, resolver, choices, engine, explainer, logger,
+    cfg, repo, md, monitor, history, subs, resolver, choices, engine, explainer, journal, syncer, logger,
   }, llm);
   await startBot(bot, logger);
 

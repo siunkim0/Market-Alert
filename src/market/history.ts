@@ -46,6 +46,7 @@ export class HistoryService {
   private readonly log: Logger;
   /** `${symbol}|${sessionDate}` → σ */
   private readonly sigmaCache = new Map<string, number | null>();
+  private readonly volCache = new Map<string, number | null>();
 
   constructor(
     private readonly repo: Repo,
@@ -60,7 +61,8 @@ export class HistoryService {
   async refresh(symbol: string): Promise<number> {
     const bars = await this.md.dailyBars(symbol, this.window + 5);
     this.repo.upsertBars(symbol, bars);
-    for (const k of this.sigmaCache.keys()) if (k.startsWith(`${symbol}|`)) this.sigmaCache.delete(k);
+    for (const c of [this.sigmaCache, this.volCache])
+      for (const k of c.keys()) if (k.startsWith(`${symbol}|`)) c.delete(k);
     this.log.debug({ symbol, count: bars.length }, '일봉 갱신');
     return bars.length;
   }
@@ -83,6 +85,16 @@ export class HistoryService {
     const s = computeSigma(bars, this.window);
     if (bars.length > 0) this.sigmaCache.set(key, s); // 일봉이 아직 없으면 캐시하지 않는다
     return s;
+  }
+
+  /** sessionDate 이전 완성 봉 기준 평균 거래량 (window일). 거래량이 없으면 null */
+  avgVolume(symbol: string, sessionDate: string): number | null {
+    const key = `${symbol}|${sessionDate}`;
+    if (this.volCache.has(key)) return this.volCache.get(key) ?? null;
+    const bars = this.repo.getBars(symbol, this.window, sessionDate).filter((b) => b.volume > 0);
+    const v = bars.length >= Math.ceil(this.window / 2) ? bars.reduce((a, b) => a + b.volume, 0) / bars.length : null;
+    if (bars.length > 0) this.volCache.set(key, v);
+    return v;
   }
 
   /** prevClose 대체값: sessionDate 이전 마지막 완성 봉 종가 */

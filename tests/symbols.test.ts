@@ -56,3 +56,22 @@ describe('/add 인자', () => {
     expect(parseAddArgs('')).toHaveProperty('error');
   });
 });
+
+import { parseDuration, parseLevelArgs } from '../src/bot/commands.js';
+
+describe('/level, /mute 인자', () => {
+  it('level', () => {
+    expect(parseLevelArgs('삼성전자 190,000 2 ELS KI 배리어')).toEqual({ query: '삼성전자', price: 190000, proximityPct: 2, note: 'ELS KI 배리어' });
+    expect(parseLevelArgs('SK 하이닉스 210000')).toEqual({ query: 'SK 하이닉스', price: 210000, proximityPct: undefined, note: undefined });
+    expect(parseLevelArgs('BTC 80000 1.5% 저항')).toMatchObject({ price: 80000, proximityPct: 1.5, note: '저항' });
+    expect(parseLevelArgs('000660 210000')).toMatchObject({ query: '000660', price: 210000 });
+    expect(parseLevelArgs('삼성전자')).toHaveProperty('error');
+  });
+  it('duration', () => {
+    expect(parseDuration('2h')).toBe(7_200_000);
+    expect(parseDuration('30m')).toBe(1_800_000);
+    expect(parseDuration('1d')).toBe(86_400_000);
+    expect(parseDuration('off')).toBe(0);
+    expect(parseDuration('abc')).toBeUndefined();
+  });
+});

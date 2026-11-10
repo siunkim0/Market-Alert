@@ -28,6 +28,41 @@ export interface SymbolMetaRow {
   updated_at: string | null;
 }
 
+export type LevelDirection = 'above' | 'below' | 'cross';
+
+export interface LevelRow {
+  id: number;
+  symbol: string;
+  price: number;
+  direction: LevelDirection;
+  proximity_pct: number | null;
+  note: string | null;
+  active: number;
+  created_at: string;
+}
+
+export type TriggerType = 'sigma' | 'pct' | 'volume' | 'level' | 'position';
+
+export interface AlertLogRow {
+  id: number;
+  symbol: string;
+  trigger_type: TriggerType;
+  direction: string | null;
+  level_reached: number | null;
+  z: number | null;
+  ret_pct: number | null;
+  volume_ratio: number | null;
+  price: number | null;
+  price_time: string | null;
+  delayed: number;
+  telegram_message_id: number | null;
+  level_id: number | null;
+  session_date: string;
+  created_at: string;
+}
+
+export type NewAlertLog = Omit<AlertLogRow, 'id' | 'created_at' | 'telegram_message_id'>;
+
 export interface BarRow {
   symbol: string;
   date: string;
@@ -49,6 +84,13 @@ export class Repo {
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('foreign_keys = ON');
     this.db.exec(readFileSync(SCHEMA_PATH, 'utf8'));
+    this.migrate();
+  }
+
+  /** 기존 DB에 나중에 추가된 컬럼을 붙인다. */
+  private migrate(): void {
+    const cols = (this.db.prepare('PRAGMA table_info(alert_log)').all() as { name: string }[]).map((c) => c.name);
+    if (!cols.includes('level_id')) this.db.exec('ALTER TABLE alert_log ADD COLUMN level_id INTEGER');
   }
 
   close(): void {
@@ -77,6 +119,75 @@ export class Repo {
 
   getWatch(symbol: string): WatchRow | undefined {
     return this.db.prepare('SELECT * FROM watchlist WHERE symbol = ?').get(symbol) as WatchRow | undefined;
+  }
+
+  updateWatchMode(symbol: string, mode: WatchMode, threshold: number): boolean {
+    return this.db.prepare('UPDATE watchlist SET mode = ?, threshold = ? WHERE symbol = ?').run(mode, threshold, symbol).changes > 0;
+  }
+
+  setMuted(symbol: string, untilIso: string | null): boolean {
+    return this.db.prepare('UPDATE watchlist SET muted_until = ? WHERE symbol = ?').run(untilIso, symbol).changes > 0;
+  }
+
+  // ── level_alerts ───────────────────────────────────────────
+  addLevel(l: { symbol: string; price: number; direction: LevelDirection; proximityPct: number | null; note: string | null }): number {
+    const r = this.db
+      .prepare(
+        `INSERT INTO level_alerts (symbol, price, direction, proximity_pct, note, active, created_at)
+         VALUES (?, ?, ?, ?, ?, 1, ?)`,
+      )
+      .run(l.symbol, l.price, l.direction, l.proximityPct, l.note, nowIso());
+    return Number(r.lastInsertRowid);
+  }
+
+  listLevels(activeOnly = true): LevelRow[] {
+    return this.db
+      .prepare(`SELECT * FROM level_alerts ${activeOnly ? 'WHERE active = 1' : ''} ORDER BY symbol, price`)
+      .all() as LevelRow[];
+  }
+
+  getLevel(id: number): LevelRow | undefined {
+    return this.db.prepare('SELECT * FROM level_alerts WHERE id = ?').get(id) as LevelRow | undefined;
+  }
+
+  setLevelDirection(id: number, direction: LevelDirection): void {
+    this.db.prepare('UPDATE level_alerts SET direction = ? WHERE id = ?').run(direction, id);
+  }
+
+  deactivateLevel(id: number): boolean {
+    return this.db.prepare('UPDATE level_alerts SET active = 0 WHERE id = ? AND active = 1').run(id).changes > 0;
+  }
+
+  // ── alert_log ──────────────────────────────────────────────
+  insertAlert(a: NewAlertLog): number {
+    const r = this.db
+      .prepare(
+        `INSERT INTO alert_log (symbol, trigger_type, direction, level_reached, z, ret_pct, volume_ratio, price,
+           price_time, delayed, level_id, session_date, created_at)
+         VALUES (@symbol, @trigger_type, @direction, @level_reached, @z, @ret_pct, @volume_ratio, @price,
+           @price_time, @delayed, @level_id, @session_date, @created_at)`,
+      )
+      .run({ ...a, created_at: nowIso() });
+    return Number(r.lastInsertRowid);
+  }
+
+  setAlertMessageId(ids: number[], messageId: number): void {
+    const stmt = this.db.prepare('UPDATE alert_log SET telegram_message_id = ? WHERE id = ?');
+    this.db.transaction(() => {
+      for (const id of ids) stmt.run(messageId, id);
+    })();
+  }
+
+  /** cooldown 복원용: 최근 생성된 알림 */
+  alertsSince(sinceIso: string): AlertLogRow[] {
+    return this.db.prepare('SELECT * FROM alert_log WHERE created_at >= ? ORDER BY id').all(sinceIso) as AlertLogRow[];
+  }
+
+  /** 레벨 알림의 근접 알림이 이미 나갔는지 */
+  levelNearSent(levelId: number): boolean {
+    return !!this.db
+      .prepare("SELECT 1 FROM alert_log WHERE level_id = ? AND trigger_type = 'level' AND direction = 'near' LIMIT 1")
+      .get(levelId);
   }
 
   // ── symbol_meta ────────────────────────────────────────────

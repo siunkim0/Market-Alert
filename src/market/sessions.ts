@@ -55,3 +55,32 @@ export function isSessionOpen(spec: SessionSpec, at: Date, delaySec = 0): boolea
 export function sessionDate(spec: SessionSpec, at: Date, delaySec = 0): string {
   return localDate(new Date(at.getTime() - delaySec * 1000), spec.timezone);
 }
+
+/**
+ * `at`(가격 시각) 기준 오늘 정규장 경과 분과 전체 분. 장 밖이면 undefined.
+ * 24x7은 현지(UTC) 0시부터 1440분.
+ */
+export function sessionProgress(spec: SessionSpec, at: Date): { elapsedMin: number; totalMin: number } | undefined {
+  const ranges = parseSession(spec.session);
+  const { weekday, minutes } = localClock(at, spec.timezone);
+  if (ranges === 'always') return { elapsedMin: minutes, totalMin: 1440 };
+  for (const r of ranges) {
+    if (r.start < r.end && r.days.has(weekday) && minutes >= r.start && minutes < r.end) {
+      return { elapsedMin: minutes - r.start, totalMin: r.end - r.start };
+    }
+  }
+  return undefined;
+}
+
+export type MarketKey = 'KRX' | 'US' | 'CRYPTO' | 'OTHER';
+
+const CRYPTO_EXCHANGES = new Set(['BINANCE', 'BYBIT', 'OKX', 'COINBASE', 'UPBIT', 'BITHUMB', 'BITGET', 'KRAKEN', 'CRYPTO']);
+
+/** benchmark·digest 구분용 시장 */
+export function marketOf(symbol: string, timezone: string | undefined): MarketKey {
+  const exch = symbol.split(':')[0]?.toUpperCase() ?? '';
+  if (exch === 'KRX' || timezone === 'Asia/Seoul') return 'KRX';
+  if (CRYPTO_EXCHANGES.has(exch)) return 'CRYPTO';
+  if (timezone === 'America/New_York' || ['NASDAQ', 'NYSE', 'AMEX', 'BATS', 'CBOE'].includes(exch)) return 'US';
+  return 'OTHER';
+}

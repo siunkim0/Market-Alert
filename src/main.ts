@@ -1,4 +1,7 @@
+import { Api } from 'grammy';
 import { createBot, startBot } from './bot/bot.js';
+import { AlertNotifier } from './bot/notifier.js';
+import { TriggerEngine } from './triggers/engine.js';
 import { Choices } from './bot/confirm.js';
 import { loadConfig } from './config.js';
 import { Repo } from './db/repo.js';
@@ -35,6 +38,28 @@ async function main(): Promise<void> {
   const resolver = new SymbolResolver(conf.aliases, md);
   const choices = new Choices(logger);
 
+  const notifier = new AlertNotifier(new Api(env.TELEGRAM_BOT_TOKEN), env.TELEGRAM_ALLOWED_CHAT_IDS, repo, logger);
+  const engine = new TriggerEngine({
+    repo,
+    monitor,
+    sink: notifier,
+    logger,
+    rules: {
+      esc: {
+        sigmaSteps: cfg.escalation.sigma_steps,
+        pctStep: cfg.escalation.pct_step,
+        pctBase: cfg.defaults.pct_threshold,
+      },
+      volumeRatio: cfg.defaults.volume_ratio,
+      volumeWarmupMin: 30,
+      levelDefaultProximityPct: cfg.level_default_proximity_pct,
+    },
+    benchmarks: cfg.benchmarks,
+    nameOf: (s) => resolver.displayName(s) ?? repo.getMeta(s)?.description ?? s,
+  });
+  engine.start();
+  subs.addSource(() => engine.levelSymbols());
+
   // 구독 대상 메타(세션·지연) 준비: DB 복원 → 없으면 조회
   const symbols = subs.desired();
   for (const s of symbols) {
@@ -61,7 +86,7 @@ async function main(): Promise<void> {
   const crons = scheduleDailyBars(cfg.daily_bars_refresh, history, () => subs.desired(), logger);
 
   const bot = createBot(env.TELEGRAM_BOT_TOKEN, env.TELEGRAM_ALLOWED_CHAT_IDS, {
-    cfg, repo, md, monitor, history, subs, resolver, choices, logger,
+    cfg, repo, md, monitor, history, subs, resolver, choices, engine, logger,
   });
   await startBot(bot, logger);
 
@@ -71,6 +96,7 @@ async function main(): Promise<void> {
     stopping = true;
     logger.info({ sig }, '종료 중');
     for (const c of crons) c.stop();
+    engine.stop();
     subs.stop();
     await bot.stop().catch(() => undefined);
     await md.close();

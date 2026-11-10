@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS alert_log (
   explanation TEXT,
   sources_json TEXT,
   telegram_message_id INTEGER,         -- 원인 요약 edit용
+  level_id INTEGER,                    -- level 알림이면 level_alerts.id
   session_date TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
@@ -88,3 +89,5 @@ CREATE TABLE IF NOT EXISTS sync_state (
   last_synced_at TEXT,
   cursor TEXT
 );
+
+CREATE INDEX IF NOT EXISTS idx_alert_log_session ON alert_log (session_date, symbol);

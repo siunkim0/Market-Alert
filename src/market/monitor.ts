@@ -7,7 +7,7 @@ import type { Logger } from '../logger.js';
 import { DelayTracker, type DelayConfig, type DelayState } from './delay.js';
 import { computeReturn, computeZ, type HistoryService } from './history.js';
 import type { Quote, SymbolMeta } from './marketData.js';
-import { isSessionOpen, sessionDate, type SessionSpec } from './sessions.js';
+import { isSessionOpen, marketOf, sessionDate, sessionProgress, type MarketKey, type SessionSpec } from './sessions.js';
 
 export interface Snapshot {
   symbol: string;
@@ -18,6 +18,11 @@ export interface Snapshot {
   r: number | null;
   sigma: number | null;
   z: number | null;
+  /** 거래량 비율 = 오늘 누적 / (20일 평균 × 장 경과 비율). 계산 불가면 null */
+  volumeRatio: number | null;
+  /** 가격 시각 기준 장 경과 분 (장 밖이면 null) */
+  sessionElapsedMin: number | null;
+  market: MarketKey;
   delay: DelayState;
 }
 
@@ -50,6 +55,10 @@ export class MarketMonitor {
 
   setMeta(meta: SymbolMeta): void {
     this.specs.set(meta.symbol, { session: meta.session, timezone: meta.timezone });
+  }
+
+  timezone(symbol: string): string | undefined {
+    return this.specs.get(symbol)?.timezone;
   }
 
   hasMeta(symbol: string): boolean {
@@ -97,15 +106,28 @@ export class MarketMonitor {
     const spec = this.spec(symbol);
     const delaySec = delay.delaySec ?? 0;
     const marketOpen = isSessionOpen(spec, now, delaySec);
+    const market = marketOf(symbol, this.specs.get(symbol)?.timezone);
     if (!quote) {
-      return { symbol, quote, sessionDate: undefined, marketOpen, prevClose: undefined, r: null, sigma: null, z: null, delay };
+      return {
+        symbol, quote, sessionDate: undefined, marketOpen, prevClose: undefined, r: null, sigma: null, z: null,
+        volumeRatio: null, sessionElapsedMin: null, market, delay,
+      };
     }
     // 거래일은 가격 시각 기준 (지연 종목은 lp_time이 이미 과거)
     const sd = sessionDate(spec, quote.priceTime);
     const prevClose = quote.prevClose ?? this.history.lastClose(symbol, sd);
     const r = computeReturn(quote.price, prevClose);
     const sigma = this.history.sigma(symbol, sd);
-    return { symbol, quote, sessionDate: sd, marketOpen, prevClose, r, sigma, z: computeZ(r, sigma), delay };
+    const progress = sessionProgress(spec, quote.priceTime);
+    let volumeRatio: number | null = null;
+    if (progress && quote.volume !== undefined && progress.elapsedMin > 0) {
+      const avg = this.history.avgVolume(symbol, sd);
+      if (avg) volumeRatio = quote.volume / (avg * Math.min(1, progress.elapsedMin / progress.totalMin));
+    }
+    return {
+      symbol, quote, sessionDate: sd, marketOpen, prevClose, r, sigma, z: computeZ(r, sigma),
+      volumeRatio, sessionElapsedMin: progress?.elapsedMin ?? null, market, delay,
+    };
   }
 
   /** 장중 종목이 하나라도 있으면 quote가 와야 한다 (무응답 재연결 판단). */

@@ -8,8 +8,13 @@ import { MarketDataError, type MarketData, type SymbolCandidate } from '../marke
 import type { MarketMonitor } from '../market/monitor.js';
 import type { SubscriptionManager } from '../market/subscriptions.js';
 import type { SymbolResolver } from '../market/symbols.js';
+import type { TriggerEngine } from '../triggers/engine.js';
+import { fmtLevel } from '../triggers/engine.js';
+import { fmtKst } from '../time.js';
 import type { Choices } from './confirm.js';
-import { esc, formatList, formatStatus, thresholdLabel } from './format.js';
+import { esc, fmtPct, fmtPrice, formatList, formatStatus, thresholdLabel } from './format.js';
+
+type ChoiceRun = (ctx: Context) => Promise<void>;
 
 export interface BotDeps {
   cfg: AppConfig;
@@ -20,6 +25,7 @@ export interface BotDeps {
   subs: SubscriptionManager;
   resolver: SymbolResolver;
   choices: Choices;
+  engine: TriggerEngine;
   logger: Logger;
 }
 
@@ -27,6 +33,11 @@ export const COMMANDS: { command: string; description: string }[] = [
   { command: 'add', description: '종목 추가: /add <종목> [sigma|pct] [값]' },
   { command: 'remove', description: '종목 제거: /remove <종목>' },
   { command: 'list', description: 'watchlist와 현재 움직임' },
+  { command: 'mode', description: '기준 변경: /mode <종목> sigma|pct <값>' },
+  { command: 'level', description: '레벨 알림: /level <종목> <가격> [근접%] [메모]' },
+  { command: 'levels', description: '레벨 알림 목록' },
+  { command: 'unlevel', description: '레벨 알림 삭제: /unlevel <id>' },
+  { command: 'mute', description: '음소거: /mute <종목> <2h|30m|1d|off>' },
   { command: 'status', description: '시세 연결·지연 상태' },
   { command: 'help', description: '사용법' },
 ];
@@ -37,9 +48,14 @@ const HELP = [
   '<code>/add &lt;종목&gt; [sigma|pct] [값]</code> — watchlist 추가',
   '  예: <code>/add 삼성전자</code>, <code>/add 하이닉스 pct 4</code>, <code>/add AAPL sigma 2.5</code>, <code>/add BINANCE:BTCUSDT</code>',
   '<code>/remove &lt;종목&gt;</code> — 제거',
-  '<code>/list</code> — 종목별 기준, 현재가·r·z, 지연 여부',
+  '<code>/list</code> — 종목별 기준, 현재가·r·z, 오늘 단계, 지연 여부',
+  '<code>/mode &lt;종목&gt; sigma|pct &lt;값&gt;</code> — 기준 변경',
+  '<code>/level &lt;종목&gt; &lt;가격&gt; [근접%] [메모]</code> — 레벨 알림 (근접 1회 + 도달 1회)',
+  '<code>/levels</code>, <code>/unlevel &lt;id&gt;</code> — 레벨 알림 목록·삭제',
+  '<code>/mute &lt;종목&gt; &lt;2h|30m|1d|off&gt;</code> — 일시 음소거',
   '<code>/status</code> — 시세 연결 상태, 종목별 마지막 quote·측정 지연',
   '',
+  '알림은 기준을 처음 넘을 때 오고, 같은 날에는 다음 단계를 넘을 때만 다시 옵니다 (σ: 3→4→5→6, %: 5→7.5→10).',
   '시각은 모두 KST, 가격 시각(lp_time) 기준입니다. 지연 종목에는 [N분 지연]이 붙습니다.',
 ].join('\n');
 
@@ -75,6 +91,46 @@ export function parseAddArgs(text: string): AddArgs | { error: string } {
   return { query, mode, threshold };
 }
 
+/** '2h' | '30m' | '1d' | '1.5h' → ms. 'off'는 0 */
+export function parseDuration(s: string): number | undefined {
+  if (/^(off|해제|0)$/i.test(s.trim())) return 0;
+  const m = /^(\d+(?:\.\d+)?)\s*(m|min|분|h|시간|d|일)$/i.exec(s.trim());
+  if (!m) return undefined;
+  const n = Number(m[1]);
+  const u = m[2]!.toLowerCase();
+  const mult = u.startsWith('m') || u === '분' ? 60_000 : u.startsWith('h') || u === '시간' ? 3_600_000 : 86_400_000;
+  const ms = n * mult;
+  return ms > 0 && ms <= 30 * 86_400_000 ? ms : undefined;
+}
+
+const PriceSchema = z.coerce.number().positive();
+
+export interface LevelArgs {
+  query: string;
+  price: number;
+  proximityPct: number | undefined;
+  note: string | undefined;
+}
+
+/** '/level 삼성전자 190,000 2 ELS 배리어' → 가격 앞까지가 종목, 가격 다음 숫자(옵션)는 근접%, 나머지는 메모 */
+export function parseLevelArgs(text: string): LevelArgs | { error: string } {
+  const tokens = text.trim().split(/\s+/).filter(Boolean);
+  const isNum = (t: string) => /^\d[\d,]*(\.\d+)?%?$/.test(t);
+  const pi = tokens.findIndex((t, i) => i > 0 && isNum(t) && !t.endsWith('%'));
+  if (pi < 1) return { error: '형식: <code>/level &lt;종목&gt; &lt;가격&gt; [근접%] [메모]</code>' };
+  const price = PriceSchema.safeParse(tokens[pi]!.replace(/,/g, ''));
+  if (!price.success) return { error: `가격이 올바르지 않습니다: ${tokens[pi]}` };
+  let rest = tokens.slice(pi + 1);
+  let proximityPct: number | undefined;
+  if (rest[0] && isNum(rest[0])) {
+    const p = z.coerce.number().min(0).max(50).safeParse(rest[0].replace(/[%,]/g, ''));
+    if (!p.success) return { error: `근접%가 올바르지 않습니다: ${rest[0]}` };
+    proximityPct = p.data;
+    rest = rest.slice(1);
+  }
+  return { query: tokens.slice(0, pi).join(' '), price: price.data, proximityPct, note: rest.join(' ') || undefined };
+}
+
 // ── 핸들러 ──────────────────────────────────────────────────
 export function registerCommands(bot: Bot, d: BotDeps): void {
   const log = d.logger.child({ mod: 'commands' });
@@ -91,35 +147,45 @@ export function registerCommands(bot: Bot, d: BotDeps): void {
       })),
     );
 
-  async function addSymbol(ctx: Context, symbol: string, aliasName: string | undefined, args: AddArgs): Promise<void> {
-    let meta;
+  const findWatch = (q: string) => d.repo.listWatch().find((w) => d.resolver.matches(q, w.symbol, w.display_name));
+
+  /** 종목 정보 조회·저장. 알 수 없는 symbol이면 후보 버튼을 보내고 undefined */
+  async function ensureMeta(ctx: Context, symbol: string, onPick: (c: SymbolCandidate) => ChoiceRun) {
     try {
-      meta = await d.md.symbolInfo(symbol);
+      const meta = await d.md.symbolInfo(symbol);
+      d.repo.upsertMeta({
+        symbol,
+        description: meta.description,
+        currency: meta.currency ?? null,
+        timezone: meta.timezone,
+        session: meta.session,
+      });
+      d.monitor.setMeta(meta);
+      return meta;
     } catch (e) {
       if (e instanceof MarketDataError && e.code === 'SYMBOL_ERROR') {
         const ticker = symbol.split(':')[1] ?? symbol;
         const cands = (await d.md.search(ticker).catch(() => [])).slice(0, 6);
         if (cands.length === 0) {
           await ctx.reply(`알 수 없는 종목입니다: <code>${esc(symbol)}</code>`, html);
-          return;
+          return undefined;
         }
         await ctx.reply(`알 수 없는 종목입니다: <code>${esc(symbol)}</code>\n이 중에 있나요?`, {
           ...html,
-          reply_markup: candidateButtons(ctx, cands, args),
+          reply_markup: d.choices.keyboard(
+            ctx.chat!.id,
+            cands.map((c) => ({ label: `${c.symbol} · ${c.description}`.slice(0, 60), run: onPick(c) })),
+          ),
         });
         return;
       }
       throw e;
     }
+  }
 
-    d.repo.upsertMeta({
-      symbol,
-      description: meta.description,
-      currency: meta.currency ?? null,
-      timezone: meta.timezone,
-      session: meta.session,
-    });
-    d.monitor.setMeta(meta);
+  async function addSymbol(ctx: Context, symbol: string, aliasName: string | undefined, args: AddArgs): Promise<void> {
+    const meta = await ensureMeta(ctx, symbol, (c) => (c2) => addSymbol(c2, c.symbol, d.resolver.displayName(c.symbol), args));
+    if (!meta) return;
 
     const mode = args.mode ?? d.cfg.defaults.mode;
     const threshold = args.threshold ?? (mode === 'sigma' ? d.cfg.defaults.sigma_threshold : d.cfg.defaults.pct_threshold);
@@ -194,8 +260,113 @@ export function registerCommands(bot: Bot, d: BotDeps): void {
   });
 
   bot.command('list', async (ctx) => {
-    const items = d.repo.listWatch().map((w) => ({ w, s: d.monitor.snapshot(w.symbol) }));
+    const items = d.repo.listWatch().map((w) => {
+      const snap = d.monitor.snapshot(w.symbol);
+      return { w, s: snap, today: d.engine.todaySteps(w, snap.sessionDate) };
+    });
     await ctx.reply(formatList(items), html);
+  });
+
+  bot.command('mode', async (ctx) => {
+    const tokens = ctx.match.trim().split(/\s+/).filter(Boolean);
+    const usage = '형식: <code>/mode &lt;종목&gt; sigma|pct &lt;값&gt;</code>';
+    if (tokens.length < 3) return void (await ctx.reply(usage, html));
+    const mode = ModeSchema.safeParse(tokens.at(-2)!.toLowerCase());
+    const th = ThresholdSchema.safeParse(tokens.at(-1));
+    if (!mode.success || !th.success) return void (await ctx.reply(usage, html));
+    const q = tokens.slice(0, -2).join(' ');
+    const w = findWatch(q);
+    if (!w) return void (await ctx.reply(`watchlist에 없는 종목입니다: ${esc(q)}`, html));
+    d.repo.updateWatchMode(w.symbol, mode.data, th.data);
+    log.info({ symbol: w.symbol, mode: mode.data, threshold: th.data }, '기준 변경');
+    await ctx.reply(
+      `<b>${esc(w.display_name ?? w.symbol)}</b> 기준: ${thresholdLabel(w)} → ${thresholdLabel({ mode: mode.data, threshold: th.data })}\n` +
+        '오늘 이미 보낸 단계보다 높은 단계부터 알립니다.',
+      html,
+    );
+  });
+
+  async function addLevel(ctx: Context, symbol: string, a: LevelArgs): Promise<void> {
+    const meta = await ensureMeta(ctx, symbol, (c) => (c2) => addLevel(c2, c.symbol, a));
+    if (!meta) return;
+    const snap = d.monitor.snapshot(symbol);
+    const price = snap.quote?.price;
+    const direction = price === undefined ? 'cross' : price < a.price ? 'above' : 'below';
+    const id = d.repo.addLevel({ symbol, price: a.price, direction, proximityPct: a.proximityPct ?? null, note: a.note ?? null });
+    d.engine.reloadLevels();
+    d.subs.request();
+    const name = d.repo.getWatch(symbol)?.display_name ?? d.resolver.displayName(symbol) ?? meta.localDescription ?? meta.description;
+    const prox = a.proximityPct ?? d.cfg.level_default_proximity_pct;
+    const dirText =
+      direction === 'above' ? '위로 돌파 시' : direction === 'below' ? '아래로 이탈 시' : '방향은 첫 시세로 결정';
+    await ctx.reply(
+      `레벨 알림 #${id}: <b>${esc(name)}</b> <code>${esc(symbol)}</code> ${fmtPrice(a.price)} (${dirText})\n` +
+        `근접 ${prox}% 이내 1회 + 도달 1회` +
+        (price !== undefined ? ` · 현재가 ${fmtPrice(price)}` : '') +
+        (a.note ? `\n메모: ${esc(a.note)}` : ''),
+      html,
+    );
+  }
+
+  bot.command('level', async (ctx) => {
+    const a = parseLevelArgs(ctx.match);
+    if ('error' in a) return void (await ctx.reply(a.error, html));
+    const w = findWatch(a.query);
+    if (w) return addLevel(ctx, w.symbol, a);
+    const r = await d.resolver.resolve(a.query);
+    if (r.kind === 'resolved') return addLevel(ctx, r.symbol, a);
+    if (r.kind === 'choices') {
+      await ctx.reply(`"${esc(a.query)}" 후보가 여러 개입니다. 선택하세요.`, {
+        ...html,
+        reply_markup: d.choices.keyboard(
+          ctx.chat!.id,
+          r.candidates.map((c) => ({ label: `${c.symbol} · ${c.description}`.slice(0, 60), run: (c2) => addLevel(c2, c.symbol, a) })),
+        ),
+      });
+      return;
+    }
+    await ctx.reply(`"${esc(a.query)}"에 해당하는 종목을 찾지 못했습니다.`, html);
+  });
+
+  bot.command('levels', async (ctx) => {
+    const rows = d.repo.listLevels(true);
+    if (rows.length === 0) return void (await ctx.reply('활성 레벨 알림이 없습니다.'));
+    const lines = rows.map((l) => {
+      const snap = d.monitor.snapshot(l.symbol);
+      const cur = snap.quote ? ` · 현재 ${fmtPrice(snap.quote.price)} (${fmtPct(l.price / snap.quote.price - 1)} 남음)` : '';
+      const dir = l.direction === 'above' ? '▲' : l.direction === 'below' ? '▼' : '↕';
+      const name = d.repo.getWatch(l.symbol)?.display_name ?? d.resolver.displayName(l.symbol) ?? l.symbol;
+      return `#${l.id} ${esc(name)} <code>${esc(l.symbol)}</code> ${dir} ${fmtPrice(l.price)}${cur}${l.note ? ` — ${esc(l.note)}` : ''}`;
+    });
+    await ctx.reply(`<b>레벨 알림</b>\n${lines.join('\n')}`, html);
+  });
+
+  bot.command('unlevel', async (ctx) => {
+    const id = z.coerce.number().int().positive().safeParse(ctx.match.trim().replace(/^#/, ''));
+    if (!id.success) return void (await ctx.reply('형식: <code>/unlevel &lt;id&gt;</code> (id는 /levels 참고)', html));
+    if (!d.repo.deactivateLevel(id.data)) return void (await ctx.reply(`활성 레벨 알림 #${id.data}이 없습니다.`));
+    d.engine.reloadLevels();
+    d.subs.request();
+    await ctx.reply(`레벨 알림 #${id.data}을 삭제했습니다.`);
+  });
+
+  bot.command('mute', async (ctx) => {
+    const tokens = ctx.match.trim().split(/\s+/).filter(Boolean);
+    const usage = '형식: <code>/mute &lt;종목&gt; &lt;2h|30m|1d|off&gt;</code>';
+    if (tokens.length < 2) return void (await ctx.reply(usage, html));
+    const ms = parseDuration(tokens.at(-1)!);
+    if (ms === undefined) return void (await ctx.reply(usage, html));
+    const q = tokens.slice(0, -1).join(' ');
+    const w = findWatch(q);
+    if (!w) return void (await ctx.reply(`watchlist에 없는 종목입니다: ${esc(q)}`, html));
+    const name = esc(w.display_name ?? w.symbol);
+    if (ms === 0) {
+      d.repo.setMuted(w.symbol, null);
+      return void (await ctx.reply(`<b>${name}</b> 음소거를 해제했습니다.`, html));
+    }
+    const until = new Date(Date.now() + ms);
+    d.repo.setMuted(w.symbol, until.toISOString());
+    await ctx.reply(`<b>${name}</b> ${fmtKst(until)} KST까지 음소거합니다.`, html);
   });
 
   bot.command('status', async (ctx) => {

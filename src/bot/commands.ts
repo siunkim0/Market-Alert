@@ -1,7 +1,7 @@
 import type { Bot, Context } from 'grammy';
 import { z } from 'zod';
 import type { AppConfig } from '../config.js';
-import type { Repo, WatchMode } from '../db/repo.js';
+import type { Criteria, Repo, WatchMode } from '../db/repo.js';
 import type { Logger } from '../logger.js';
 import type { HistoryService } from '../market/history.js';
 import { MarketDataError, type MarketData, type SymbolCandidate } from '../market/marketData.js';
@@ -21,7 +21,7 @@ import {
 import { fmtLevel } from '../triggers/engine.js';
 import { fmtKst } from '../time.js';
 import type { Choices } from './confirm.js';
-import { delayTag, esc, fmtPct, fmtPrice, fmtZ, formatExplanation, formatList, formatStatus, thresholdLabel } from './format.js';
+import { criteriaLabel, delayTag, esc, fmtPct, fmtPrice, fmtZ, formatExplanation, formatList, formatStatus, thresholdLabel } from './format.js';
 
 type ChoiceRun = (ctx: Context) => Promise<void>;
 
@@ -30,7 +30,8 @@ export interface Actions {
   add(ctx: Context, args: AddArgs): Promise<void>;
   remove(ctx: Context, query: string): Promise<void>;
   list(ctx: Context): Promise<void>;
-  mode(ctx: Context, query: string, mode: WatchMode, threshold: number): Promise<void>;
+  /** 말한 기준만 바꾼다 (다른 기준은 유지, 'off'는 끄기) */
+  mode(ctx: Context, query: string, spec: CriteriaArgs): Promise<void>;
   level(ctx: Context, args: LevelArgs): Promise<void>;
   /** ms=0이면 해제 */
   mute(ctx: Context, query: string, ms: number): Promise<void>;
@@ -58,11 +59,19 @@ export interface BotDeps {
   logger: Logger;
 }
 
+const PHASE5_COMMANDS = new Set(['buy', 'sell', 'sl', 'tp', 'pos', 'history', 'pnl', 'note', 'deltrade', 'export', 'sync']);
+const PHASE6_COMMANDS = new Set(['rules', 'digest', 'import_tv']);
+
+/** 켜진 기능의 명령어만 (Telegram 메뉴) */
+export function enabledCommands(f: { journal: boolean; rules_digest: boolean }): { command: string; description: string }[] {
+  return COMMANDS.filter((c) => (f.journal || !PHASE5_COMMANDS.has(c.command)) && (f.rules_digest || !PHASE6_COMMANDS.has(c.command)));
+}
+
 export const COMMANDS: { command: string; description: string }[] = [
-  { command: 'add', description: '종목 추가: /add <종목> [sigma|pct] [값]' },
+  { command: 'add', description: '종목 추가: /add <종목> [sigma 값] [pct 값]' },
   { command: 'remove', description: '종목 제거: /remove <종목>' },
   { command: 'list', description: 'watchlist와 현재 움직임' },
-  { command: 'mode', description: '기준 변경: /mode <종목> sigma|pct <값>' },
+  { command: 'mode', description: '기준 추가·변경·끄기: /mode <종목> sigma|pct <값|off>' },
   { command: 'level', description: '레벨 알림: /level <종목> <가격> [근접%] [메모]' },
   { command: 'levels', description: '레벨 알림 목록' },
   { command: 'unlevel', description: '레벨 알림 삭제: /unlevel <id>' },
@@ -86,64 +95,109 @@ export const COMMANDS: { command: string; description: string }[] = [
   { command: 'help', description: '사용법' },
 ];
 
-const HELP = [
+const HELP_LINES = [
   '<b>5σ Alert</b>',
   '',
-  '<code>/add &lt;종목&gt; [sigma|pct] [값]</code> — watchlist 추가',
-  '  예: <code>/add 삼성전자</code>, <code>/add 하이닉스 pct 4</code>, <code>/add AAPL sigma 2.5</code>, <code>/add BINANCE:BTCUSDT</code>',
+  '<code>/add &lt;종목&gt; [sigma 값] [pct 값]</code> — watchlist 추가 (σ·% 기준 둘 다 가능)',
+  '  예: <code>/add 삼성전자</code>, <code>/add 하이닉스 pct 4</code>, <code>/add AAPL sigma 2.5 pct 5</code>',
   '<code>/remove &lt;종목&gt;</code> — 제거',
   '<code>/list</code> — 종목별 기준, 현재가·r·z, 오늘 단계, 지연 여부',
-  '<code>/mode &lt;종목&gt; sigma|pct &lt;값&gt;</code> — 기준 변경',
+  '<code>/mode &lt;종목&gt; sigma|pct &lt;값|off&gt;</code> — 말한 기준만 추가·변경·끄기 (다른 기준은 유지)',
   '<code>/level &lt;종목&gt; &lt;가격&gt; [근접%] [메모]</code> — 레벨 알림 (근접 1회 + 도달 1회)',
   '<code>/levels</code>, <code>/unlevel &lt;id&gt;</code> — 레벨 알림 목록·삭제',
   '<code>/mute &lt;종목&gt; &lt;2h|30m|1d|off&gt;</code> — 일시 음소거',
   '<code>/why &lt;종목&gt;</code> — 지금 움직임의 원인 요약 (뉴스 + AI)',
-  '',
+  '@@P5',
   '<b>매매 기록</b>',
   '<code>/buy &lt;종목&gt; &lt;수량&gt; &lt;가격&gt; [sl=가격] [tp=가격] [fee=수수료] [메모]</code>, <code>/sell …</code>',
   '<code>/sl &lt;종목&gt; &lt;가격&gt;</code>, <code>/tp &lt;종목&gt; &lt;가격&gt;</code> — 보유 포지션 손절·익절가 (근접·도달 알림)',
   '<code>/pos</code> 포지션 · <code>/history [n|종목]</code> 거래 · <code>/pnl [today|week|month|all]</code> 손익',
   '<code>/note &lt;ID&gt; &lt;메모&gt;</code> · <code>/deltrade &lt;ID&gt;</code> · <code>/export</code> CSV · <code>/sync</code> Binance 동기화',
+  '@@P6',
   '<code>/rules</code> 매매 규칙 위반 · <code>/digest on|off</code> 장 마감 요약 (<code>/digest krx</code>로 지금 받기)',
   '<code>/import_tv</code> TradingView watchlist 가져오기 (TV 쿠키 필요)',
+  '@@END',
   '',
   '명령어 대신 문장으로도 됩니다. 예: "하이닉스 4% 움직이면 알려줘", "삼성전자 19만원 깨지면 알려줘". 실행 전에 확인 버튼이 나옵니다.',
   '<code>/status</code> — 시세 연결 상태, 종목별 마지막 quote·측정 지연',
   '',
-  '알림은 기준을 처음 넘을 때 오고, 같은 날에는 다음 단계를 넘을 때만 다시 옵니다 (σ: 3→4→5→6, %: 5→7.5→10).',
+  '알림은 기준을 처음 넘을 때 오고, 같은 날에는 다음 단계를 넘을 때만 다시 옵니다 (σ: 3→4→5→6, %: 5→7.5→10). σ·% 기준은 따로 셉니다.',
   '시각은 모두 KST, 가격 시각(lp_time) 기준입니다. 지연 종목에는 [N분 지연]이 붙습니다.',
-].join('\n');
+];
+
+/** 꺼진 기능의 도움말은 뺀다 */
+export function helpText(f: { journal: boolean; rules_digest: boolean }): string {
+  const out: string[] = [];
+  let section: 'base' | 'p5' | 'p6' = 'base';
+  for (const l of HELP_LINES) {
+    if (l === '@@P5') { section = 'p5'; if (f.journal) out.push(''); continue; }
+    if (l === '@@P6') { section = 'p6'; continue; }
+    if (l === '@@END') { section = 'base'; continue; }
+    if (section === 'p5' && !f.journal) continue;
+    if (section === 'p6' && !f.rules_digest) continue;
+    out.push(l);
+  }
+  return out.join('\n');
+}
 
 // ── 인자 파싱 ────────────────────────────────────────────────
 const ModeSchema = z.enum(['sigma', 'pct']);
 const ThresholdSchema = z.coerce.number().positive().max(100);
 
-export interface AddArgs {
-  query: string;
-  mode: WatchMode | undefined;
-  threshold: number | undefined;
+/**
+ * 기준 지정. undefined: 말하지 않음, null: 값 없이 모드만(기본값 사용), 'off': 끄기(/mode만), 숫자: 그 값
+ */
+export type CriterionSpec = number | null | 'off' | undefined;
+
+export interface CriteriaArgs {
+  sigma: CriterionSpec;
+  pct: CriterionSpec;
 }
 
-/** '/add SK 하이닉스 pct 4' → { query: 'SK 하이닉스', mode: 'pct', threshold: 4 } */
-export function parseAddArgs(text: string): AddArgs | { error: string } {
+export interface AddArgs extends CriteriaArgs {
+  query: string;
+}
+
+const MODE_ALIASES: Record<string, WatchMode> = { sigma: 'sigma', 'σ': 'sigma', '시그마': 'sigma', pct: 'pct', '%': 'pct', '퍼센트': 'pct' };
+
+/**
+ * 끝에서부터 [mode [값|off]] 쌍을 읽는다. 나머지 앞부분은 종목.
+ * 'SK 하이닉스 sigma 3 pct 5' → { rest: 'SK 하이닉스', sigma: 3, pct: 5 }
+ */
+export function parseCriteria(text: string, allowOff: boolean): ({ rest: string } & CriteriaArgs) | { error: string } {
   const tokens = text.trim().split(/\s+/).filter(Boolean);
-  let mode: WatchMode | undefined;
-  let threshold: number | undefined;
-  const last = tokens.at(-1);
-  const prev = tokens.at(-2);
-  if (prev && ModeSchema.safeParse(prev.toLowerCase()).success && last !== undefined) {
-    const t = ThresholdSchema.safeParse(last);
-    if (!t.success) return { error: `기준값이 올바르지 않습니다: ${last}` };
-    mode = prev.toLowerCase() as WatchMode;
-    threshold = t.data;
-    tokens.splice(-2, 2);
-  } else if (last && ModeSchema.safeParse(last.toLowerCase()).success) {
-    mode = last.toLowerCase() as WatchMode;
-    tokens.pop();
+  const out: CriteriaArgs = { sigma: undefined, pct: undefined };
+  for (;;) {
+    const last = tokens.at(-1);
+    const prev = tokens.at(-2);
+    const prevMode = prev ? MODE_ALIASES[prev.toLowerCase()] : undefined;
+    const lastMode = last ? MODE_ALIASES[last.toLowerCase()] : undefined;
+    if (prevMode && last !== undefined && tokens.length > 2 && !lastMode) {
+      if (out[prevMode] !== undefined) return { error: `${prevMode} 기준을 두 번 지정했습니다.` };
+      if (/^(off|끄기|해제)$/i.test(last)) {
+        if (!allowOff) return { error: '추가할 때는 off를 쓸 수 없습니다.' };
+        out[prevMode] = 'off';
+      } else {
+        const t = ThresholdSchema.safeParse(last.replace(/%$/, ''));
+        if (!t.success) return { error: `기준값이 올바르지 않습니다: ${last}` };
+        out[prevMode] = t.data;
+      }
+      tokens.splice(-2, 2);
+    } else if (lastMode && tokens.length > 1) {
+      if (out[lastMode] !== undefined) return { error: `${lastMode} 기준을 두 번 지정했습니다.` };
+      out[lastMode] = null;
+      tokens.pop();
+    } else break;
   }
-  const query = tokens.join(' ');
-  if (!query) return { error: '종목을 입력하세요. 예: <code>/add 삼성전자 sigma 3</code>' };
-  return { query, mode, threshold };
+  return { rest: tokens.join(' '), ...out };
+}
+
+/** '/add SK 하이닉스 sigma 3 pct 5' → { query: 'SK 하이닉스', sigma: 3, pct: 5 } */
+export function parseAddArgs(text: string): AddArgs | { error: string } {
+  const r = parseCriteria(text, false);
+  if ('error' in r) return r;
+  if (!r.rest) return { error: '종목을 입력하세요. 예: <code>/add 삼성전자 sigma 3 pct 5</code>' };
+  return { query: r.rest, sigma: r.sigma, pct: r.pct };
 }
 
 /** '2h' | '30m' | '1d' | '1.5h' → ms. 'off'는 0 */
@@ -236,6 +290,7 @@ export function registerCommands(bot: Bot, d: BotDeps): Actions {
   const log = d.logger.child({ mod: 'commands' });
   const html = { parse_mode: 'HTML' as const };
 
+  const HELP = helpText(d.cfg.features);
   bot.command(['start', 'help'], (ctx) => ctx.reply(HELP, html));
 
   const findWatch = (q: string) => d.repo.listWatch().find((w) => d.resolver.matches(q, w.symbol, w.display_name));
@@ -274,30 +329,40 @@ export function registerCommands(bot: Bot, d: BotDeps): Actions {
     }
   }
 
+  /** 추가 시 기준: 말한 기준만, 아무것도 말하지 않았으면 기본 모드 하나 */
+  function resolveCriteria(a: CriteriaArgs): Criteria {
+    const def = { sigma: d.cfg.defaults.sigma_threshold, pct: d.cfg.defaults.pct_threshold };
+    const v = (x: CriterionSpec, mode: WatchMode) => (x === undefined || x === 'off' ? null : x === null ? def[mode] : x);
+    const c = { sigma: v(a.sigma, 'sigma'), pct: v(a.pct, 'pct') };
+    if (c.sigma === null && c.pct === null) c[d.cfg.defaults.mode] = def[d.cfg.defaults.mode];
+    return c;
+  }
+
   async function addSymbol(ctx: Context, symbol: string, aliasName: string | undefined, args: AddArgs): Promise<void> {
     const meta = await ensureMeta(ctx, symbol, (c) => (c2) => addSymbol(c2, c.symbol, d.resolver.displayName(c.symbol), args));
     if (!meta) return;
 
-    const mode = args.mode ?? d.cfg.defaults.mode;
-    const threshold = args.threshold ?? (mode === 'sigma' ? d.cfg.defaults.sigma_threshold : d.cfg.defaults.pct_threshold);
+    const criteria = resolveCriteria(args);
     const isUs = meta.timezone === 'America/New_York';
     const displayName = aliasName ?? meta.localDescription ?? meta.description ?? symbol;
     const res = d.repo.addWatch({
       symbol,
       displayName,
-      mode,
-      threshold,
+      criteria,
       volumeEnabled: isUs ? d.cfg.defaults.volume_enabled_us : true,
     });
     if (res === 'exists') {
+      // 이미 있는 종목에 기준을 말했으면 그 기준을 추가·변경한다 (다른 기준은 유지)
+      if (args.sigma !== undefined || args.pct !== undefined) return actions.mode(ctx, symbol, args);
       const w = d.repo.getWatch(symbol);
       await ctx.reply(
-        `이미 등록된 종목입니다: <b>${esc(w?.display_name ?? symbol)}</b> <code>${esc(symbol)}</code> (기준 ${w ? thresholdLabel(w) : '-'})`,
+        `이미 등록된 종목입니다: <b>${esc(w?.display_name ?? symbol)}</b> <code>${esc(symbol)}</code> (기준 ${w ? thresholdLabel(w) : '-'})\n` +
+          `기준을 더하려면 <code>/mode ${esc(w?.display_name ?? symbol)} pct 5</code>`,
         html,
       );
       return;
     }
-    log.info({ symbol, mode, threshold }, 'watchlist 추가');
+    log.info({ symbol, criteria }, 'watchlist 추가');
     d.subs.request();
     const bars = await d.history.refresh(symbol).catch((e: Error) => {
       log.warn({ symbol, err: e.message }, '일봉 갱신 실패');
@@ -305,7 +370,7 @@ export function registerCommands(bot: Bot, d: BotDeps): Actions {
     });
     await ctx.reply(
       `추가했습니다: <b>${esc(displayName)}</b> <code>${esc(symbol)}</code>\n` +
-        `기준 ${thresholdLabel({ mode, threshold })} · ${esc(meta.timezone)} ${esc(meta.session)}` +
+        `기준 ${criteriaLabel(criteria)} · ${esc(meta.timezone)} ${esc(meta.session)}` +
         (bars === 0 ? '\n⚠️ 일봉을 받지 못해 σ 계산이 아직 안 됩니다.' : ''),
       html,
     );
@@ -388,13 +453,25 @@ export function registerCommands(bot: Bot, d: BotDeps): Actions {
       await ctx.reply(formatList(items), html);
     },
 
-    async mode(ctx, q, mode, threshold) {
+    async mode(ctx, q, spec) {
       const w = findWatch(q);
       if (!w) return void (await ctx.reply(`watchlist에 없는 종목입니다: ${esc(q)}`, html));
-      d.repo.updateWatchMode(w.symbol, mode, threshold);
-      log.info({ symbol: w.symbol, mode, threshold }, '기준 변경');
+      const def = { sigma: d.cfg.defaults.sigma_threshold, pct: d.cfg.defaults.pct_threshold };
+      const patch: Partial<Criteria> = {};
+      for (const m of ['sigma', 'pct'] as const) {
+        const x = spec[m];
+        if (x === undefined) continue;
+        patch[m] = x === 'off' ? null : x === null ? def[m] : x;
+      }
+      let next: Criteria;
+      try {
+        next = d.repo.updateCriteria(w.symbol, patch);
+      } catch (e) {
+        return void (await ctx.reply(esc((e as Error).message), html));
+      }
+      log.info({ symbol: w.symbol, criteria: next }, '기준 변경');
       await ctx.reply(
-        `<b>${esc(w.display_name ?? w.symbol)}</b> 기준: ${thresholdLabel(w)} → ${thresholdLabel({ mode, threshold })}\n` +
+        `<b>${esc(w.display_name ?? w.symbol)}</b> 기준: ${thresholdLabel(w)} → ${criteriaLabel(next)}\n` +
           '오늘 이미 보낸 단계보다 높은 단계부터 알립니다.',
         html,
       );
@@ -528,13 +605,13 @@ export function registerCommands(bot: Bot, d: BotDeps): Actions {
   bot.command('list', (ctx) => actions.list(ctx));
 
   bot.command('mode', async (ctx) => {
-    const tokens = ctx.match.trim().split(/\s+/).filter(Boolean);
-    const usage = '형식: <code>/mode &lt;종목&gt; sigma|pct &lt;값&gt;</code>';
-    if (tokens.length < 3) return void (await ctx.reply(usage, html));
-    const mode = ModeSchema.safeParse(tokens.at(-2)!.toLowerCase());
-    const th = ThresholdSchema.safeParse(tokens.at(-1));
-    if (!mode.success || !th.success) return void (await ctx.reply(usage, html));
-    await actions.mode(ctx, tokens.slice(0, -2).join(' '), mode.data, th.data);
+    const usage =
+      '형식: <code>/mode &lt;종목&gt; sigma|pct &lt;값|off&gt; [sigma|pct &lt;값|off&gt;]</code>\n' +
+      '예: <code>/mode 삼성전자 pct 5</code> (% 기준 추가), <code>/mode 삼성전자 sigma off</code> (σ 기준 끄기)';
+    const r = parseCriteria(ctx.match, true);
+    if ('error' in r) return void (await ctx.reply(`${esc(r.error)}\n${usage}`, html));
+    if (!r.rest || (r.sigma === undefined && r.pct === undefined)) return void (await ctx.reply(usage, html));
+    await actions.mode(ctx, r.rest, { sigma: r.sigma, pct: r.pct });
   });
 
   bot.command('level', async (ctx) => {
@@ -580,186 +657,190 @@ export function registerCommands(bot: Bot, d: BotDeps): Actions {
     await actions.why(ctx, q);
   });
 
-  for (const side of ['buy', 'sell'] as const) {
-    bot.command(side, async (ctx) => {
-      const a = parseTradeArgs(ctx.match);
-      if ('error' in a) return void (await ctx.reply(a.error.replace('/buy', `/${side}`), html));
-      await actions.trade(ctx, side, a);
+  // ── Phase 5: 매매 기록 (config features.journal) ──
+  if (d.cfg.features.journal) {
+    for (const side of ['buy', 'sell'] as const) {
+      bot.command(side, async (ctx) => {
+        const a = parseTradeArgs(ctx.match);
+        if ('error' in a) return void (await ctx.reply(a.error.replace('/buy', `/${side}`), html));
+        await actions.trade(ctx, side, a);
+      });
+    }
+
+    for (const kind of ['sl', 'tp'] as const) {
+      bot.command(kind, async (ctx) => {
+        const tokens = ctx.match.trim().split(/\s+/).filter(Boolean);
+        const price = PriceSchema.safeParse((tokens.at(-1) ?? '').replace(/,/g, ''));
+        if (tokens.length < 2 || !price.success) {
+          return void (await ctx.reply(`형식: <code>/${kind} &lt;종목&gt; &lt;가격&gt;</code>`, html));
+        }
+        await actions.stop(ctx, tokens.slice(0, -1).join(' '), kind, price.data);
+      });
+    }
+
+    bot.command('pos', async (ctx) => {
+      const positions = d.journal.openPositions();
+      const views = positions.map((p) => ({ position: p, snap: d.monitor.snapshot(p.symbol) }));
+      const mismatches = positionMismatches(positions, d.repo.listPositionSnapshot('binance_futures'), (s) => /^BINANCE:.+\.P$/.test(s));
+      await ctx.reply(formatPositions(views, d.syncer ? mismatches : [], nameOf), { ...html, link_preview_options: { is_disabled: true } });
     });
-  }
 
-  for (const kind of ['sl', 'tp'] as const) {
-    bot.command(kind, async (ctx) => {
-      const tokens = ctx.match.trim().split(/\s+/).filter(Boolean);
-      const price = PriceSchema.safeParse((tokens.at(-1) ?? '').replace(/,/g, ''));
-      if (tokens.length < 2 || !price.success) {
-        return void (await ctx.reply(`형식: <code>/${kind} &lt;종목&gt; &lt;가격&gt;</code>`, html));
-      }
-      await actions.stop(ctx, tokens.slice(0, -1).join(' '), kind, price.data);
+    bot.command('history', async (ctx) => {
+      const arg = ctx.match.trim();
+      let groups = d.journal.groups();
+      let n = 10;
+      if (/^\d+$/.test(arg)) n = Math.min(50, Number(arg));
+      else if (arg) groups = groups.filter((g) => d.resolver.matches(arg, g.symbol, nameOf(g.symbol)));
+      await ctx.reply(formatHistory(groups.slice(0, n), nameOf), html);
     });
-  }
 
-  bot.command('pos', async (ctx) => {
-    const positions = d.journal.openPositions();
-    const views = positions.map((p) => ({ position: p, snap: d.monitor.snapshot(p.symbol) }));
-    const mismatches = positionMismatches(positions, d.repo.listPositionSnapshot('binance_futures'), (s) => /^BINANCE:.+\.P$/.test(s));
-    await ctx.reply(formatPositions(views, d.syncer ? mismatches : [], nameOf), { ...html, link_preview_options: { is_disabled: true } });
-  });
+    bot.command('pnl', async (ctx) => {
+      const arg = (ctx.match.trim().toLowerCase() || 'today') as Period;
+      const period: Period = (['today', 'week', 'month', 'all'] as const).includes(arg) ? arg : 'today';
+      const currencyOf = (sym: string) => d.repo.getMeta(sym)?.currency ?? '?';
+      await ctx.reply(formatPnl(periodStats(d.journal.groups(), period, currencyOf), period, nameOf), html);
+    });
 
-  bot.command('history', async (ctx) => {
-    const arg = ctx.match.trim();
-    let groups = d.journal.groups();
-    let n = 10;
-    if (/^\d+$/.test(arg)) n = Math.min(50, Number(arg));
-    else if (arg) groups = groups.filter((g) => d.resolver.matches(arg, g.symbol, nameOf(g.symbol)));
-    await ctx.reply(formatHistory(groups.slice(0, n), nameOf), html);
-  });
+    bot.command('note', async (ctx) => {
+      const m = /^#?(G?)(\d+)\s+([\s\S]+)$/i.exec(ctx.match.trim());
+      if (!m) return void (await ctx.reply('형식: <code>/note &lt;기록ID 또는 G거래ID&gt; &lt;메모&gt;</code>', html));
+      const id = Number(m[2]);
+      // G12 → 그 거래의 첫 체결(#12)에 메모
+      if (!d.journal.setNote(id, m[3]!.trim())) return void (await ctx.reply(`기록 #${id}이 없습니다.`));
+      await ctx.reply(`#${id}에 메모를 남겼습니다.`);
+    });
 
-  bot.command('pnl', async (ctx) => {
-    const arg = (ctx.match.trim().toLowerCase() || 'today') as Period;
-    const period: Period = (['today', 'week', 'month', 'all'] as const).includes(arg) ? arg : 'today';
-    const currencyOf = (sym: string) => d.repo.getMeta(sym)?.currency ?? '?';
-    await ctx.reply(formatPnl(periodStats(d.journal.groups(), period, currencyOf), period, nameOf), html);
-  });
-
-  bot.command('note', async (ctx) => {
-    const m = /^#?(G?)(\d+)\s+([\s\S]+)$/i.exec(ctx.match.trim());
-    if (!m) return void (await ctx.reply('형식: <code>/note &lt;기록ID 또는 G거래ID&gt; &lt;메모&gt;</code>', html));
-    const id = Number(m[2]);
-    // G12 → 그 거래의 첫 체결(#12)에 메모
-    if (!d.journal.setNote(id, m[3]!.trim())) return void (await ctx.reply(`기록 #${id}이 없습니다.`));
-    await ctx.reply(`#${id}에 메모를 남겼습니다.`);
-  });
-
-  bot.command('deltrade', async (ctx) => {
-    const id = z.coerce.number().int().positive().safeParse(ctx.match.trim().replace(/^#/, ''));
-    if (!id.success) return void (await ctx.reply('형식: <code>/deltrade &lt;기록ID&gt;</code>', html));
-    const t = d.repo.getTrade(id.data);
-    if (!t) return void (await ctx.reply(`기록 #${id.data}이 없습니다.`));
-    if (t.source !== 'manual') return void (await ctx.reply('거래소에서 가져온 기록은 지울 수 없습니다.'));
-    await ctx.reply(
-      `기록 #${t.id}: ${esc(nameOf(t.symbol))} ${t.side === 'buy' ? '매수' : '매도'} ${t.qty} @ ${fmtPrice(t.price)} 을(를) 삭제할까요?`,
-      {
-        ...html,
-        reply_markup: d.choices.keyboard(ctx.chat.id, [
-          {
-            label: '삭제',
-            run: async (c) => {
-              d.journal.deleteManual(t.id);
-              await c.reply(`기록 #${t.id}을 삭제했습니다.`);
+    bot.command('deltrade', async (ctx) => {
+      const id = z.coerce.number().int().positive().safeParse(ctx.match.trim().replace(/^#/, ''));
+      if (!id.success) return void (await ctx.reply('형식: <code>/deltrade &lt;기록ID&gt;</code>', html));
+      const t = d.repo.getTrade(id.data);
+      if (!t) return void (await ctx.reply(`기록 #${id.data}이 없습니다.`));
+      if (t.source !== 'manual') return void (await ctx.reply('거래소에서 가져온 기록은 지울 수 없습니다.'));
+      await ctx.reply(
+        `기록 #${t.id}: ${esc(nameOf(t.symbol))} ${t.side === 'buy' ? '매수' : '매도'} ${t.qty} @ ${fmtPrice(t.price)} 을(를) 삭제할까요?`,
+        {
+          ...html,
+          reply_markup: d.choices.keyboard(ctx.chat.id, [
+            {
+              label: '삭제',
+              run: async (c) => {
+                d.journal.deleteManual(t.id);
+                await c.reply(`기록 #${t.id}을 삭제했습니다.`);
+              },
             },
-          },
-        ]),
-      },
-    );
-  });
-
-  bot.command('export', async (ctx) => {
-    const trades = d.repo.listTrades();
-    if (trades.length === 0) return void (await ctx.reply('기록이 없습니다.'));
-    const name = `trades_${new Date().toISOString().slice(0, 10)}.csv`;
-    await ctx.replyWithDocument(new InputFile(Buffer.from(tradesCsv(trades), 'utf8'), name), { caption: `체결 ${trades.length}건` });
-  });
-
-  bot.command('sync', async (ctx) => {
-    if (!d.syncer) return void (await ctx.reply('Binance 조회용 키(BINANCE_API_KEY/SECRET)가 없습니다.'));
-    await ctx.replyWithChatAction('typing').catch(() => undefined);
-    try {
-      const r = await d.syncer.sync();
-      await ctx.reply(`동기화 완료: 새 체결 ${r.inserted}건${r.symbols.length ? ` (${r.symbols.map(esc).join(', ')})` : ''}`, html);
-    } catch (e) {
-      await ctx.reply(`동기화 실패: ${esc((e as Error).message)}`, html);
-    }
-  });
-
-  bot.command('rules', async (ctx) => {
-    const kstMidnight = (d: string) => new Date(`${d}T00:00:00+09:00`).toISOString();
-    const sum = d.rules.summary(kstMidnight(periodStart('week')), kstMidnight(periodStart('month')));
-    const rules = Object.keys(RULE_LABEL) as RuleName[];
-    const lim = d.cfg.trading_rules;
-    const limits: Record<RuleName, string> = {
-      max_trades_per_day: `하루 ${lim.max_trades_per_day}회`,
-      max_loss_R: `-${lim.max_loss_R}R`,
-      require_stop_loss: lim.require_stop_loss ? '켜짐' : '꺼짐',
-    };
-    const lines = rules.map((r) => `${RULE_LABEL[r]} (${limits[r]}): 이번 주 ${sum.week.get(r) ?? 0} · 이번 달 ${sum.month.get(r) ?? 0}`);
-    const recent = sum.recent.map(
-      (v) => `• ${fmtKst(new Date(v.occurred_at))} ${esc(nameOf(v.symbol))} ${RULE_LABEL[v.rule as RuleName] ?? esc(v.rule)} — ${esc(v.detail)}`,
-    );
-    await ctx.reply(`<b>매매 규칙</b>\n${lines.join('\n')}${recent.length ? `\n\n<b>최근 위반</b>\n${recent.join('\n')}` : ''}`, html);
-  });
-
-  bot.command('digest', async (ctx) => {
-    const arg = ctx.match.trim().toLowerCase();
-    if (arg === 'on' || arg === 'off') {
-      d.digest.setEnabled(arg === 'on');
-      return void (await ctx.reply(`장 마감 요약을 ${arg === 'on' ? '켰습니다' : '껐습니다'}.`));
-    }
-    if (arg === 'krx' || arg === 'us' || arg === 'crypto') {
-      await ctx.replyWithChatAction('typing').catch(() => undefined);
-      const reason = await d.digest.run(arg as DigestMarket, true);
-      if (reason) await ctx.reply(`보낼 요약이 없습니다: ${esc(reason)}`, html);
-      return;
-    }
-    const t = d.cfg.digest;
-    await ctx.reply(
-      `장 마감 요약: ${d.digest.enabled() ? '켜짐' : '꺼짐'}\nKRX ${t.krx} · 미국 ${t.us} · 크립토 ${t.crypto} (KST)\n` +
-        '<code>/digest on|off</code>, 지금 받기: <code>/digest krx|us|crypto</code>',
-      html,
-    );
-  });
-
-  bot.command('import_tv', async (ctx) => {
-    let lists;
-    try {
-      lists = await d.md.watchlists();
-    } catch (e) {
-      if (e instanceof MarketDataError && e.code === 'NO_CREDENTIALS') {
-        return void (await ctx.reply('TradingView 쿠키(TV_SESSION, TV_SIGNATURE)를 .env에 넣어야 합니다.'));
-      }
-      return void (await ctx.reply(`watchlist를 가져오지 못했습니다: ${esc((e as Error).message)}`, html));
-    }
-    const nonEmpty = lists.filter((l) => l.symbols.length > 0);
-    if (nonEmpty.length === 0) return void (await ctx.reply('TradingView watchlist가 비어 있습니다.'));
-    await ctx.reply('가져올 watchlist를 고르세요. 이미 있는 종목은 건너뜁니다.', {
-      reply_markup: d.choices.keyboard(
-        ctx.chat.id,
-        nonEmpty.map((l) => ({
-          label: `${l.name} (${l.symbols.length})`.slice(0, 60),
-          run: async (c) => {
-            const added: string[] = [];
-            const failed: string[] = [];
-            const existing = new Set(d.repo.listWatch().map((w) => w.symbol));
-            for (const sym of l.symbols.filter((x) => !existing.has(x))) {
-              try {
-                const meta = await d.md.symbolInfo(sym);
-                d.repo.upsertMeta({ symbol: sym, description: meta.description, currency: meta.currency ?? null, timezone: meta.timezone, session: meta.session });
-                d.monitor.setMeta(meta);
-                const mode = d.cfg.defaults.mode;
-                d.repo.addWatch({
-                  symbol: sym,
-                  displayName: d.resolver.displayName(sym) ?? meta.localDescription ?? meta.description,
-                  mode,
-                  threshold: mode === 'sigma' ? d.cfg.defaults.sigma_threshold : d.cfg.defaults.pct_threshold,
-                  volumeEnabled: meta.timezone === 'America/New_York' ? d.cfg.defaults.volume_enabled_us : true,
-                });
-                added.push(sym);
-              } catch {
-                failed.push(sym);
-              }
-            }
-            d.subs.request();
-            void d.history.refreshAll(added);
-            await c.reply(
-              `"${esc(l.name)}" 가져오기: 추가 ${added.length} · 이미 있음 ${l.symbols.length - added.length - failed.length}` +
-                (failed.length ? ` · 실패 ${failed.length} (${failed.map(esc).join(', ')})` : ''),
-              html,
-            );
-          },
-        })),
-      ),
+          ]),
+        },
+      );
     });
-  });
+
+    bot.command('export', async (ctx) => {
+      const trades = d.repo.listTrades();
+      if (trades.length === 0) return void (await ctx.reply('기록이 없습니다.'));
+      const name = `trades_${new Date().toISOString().slice(0, 10)}.csv`;
+      await ctx.replyWithDocument(new InputFile(Buffer.from(tradesCsv(trades), 'utf8'), name), { caption: `체결 ${trades.length}건` });
+    });
+
+    bot.command('sync', async (ctx) => {
+      if (!d.syncer) return void (await ctx.reply('Binance 조회용 키(BINANCE_API_KEY/SECRET)가 없습니다.'));
+      await ctx.replyWithChatAction('typing').catch(() => undefined);
+      try {
+        const r = await d.syncer.sync();
+        await ctx.reply(`동기화 완료: 새 체결 ${r.inserted}건${r.symbols.length ? ` (${r.symbols.map(esc).join(', ')})` : ''}`, html);
+      } catch (e) {
+        await ctx.reply(`동기화 실패: ${esc((e as Error).message)}`, html);
+      }
+    });
+  }
+
+  // ── Phase 6: 규칙·digest·TV 가져오기 (config features.rules_digest) ──
+  if (d.cfg.features.rules_digest) {
+    bot.command('rules', async (ctx) => {
+      const kstMidnight = (d: string) => new Date(`${d}T00:00:00+09:00`).toISOString();
+      const sum = d.rules.summary(kstMidnight(periodStart('week')), kstMidnight(periodStart('month')));
+      const rules = Object.keys(RULE_LABEL) as RuleName[];
+      const lim = d.cfg.trading_rules;
+      const limits: Record<RuleName, string> = {
+        max_trades_per_day: `하루 ${lim.max_trades_per_day}회`,
+        max_loss_R: `-${lim.max_loss_R}R`,
+        require_stop_loss: lim.require_stop_loss ? '켜짐' : '꺼짐',
+      };
+      const lines = rules.map((r) => `${RULE_LABEL[r]} (${limits[r]}): 이번 주 ${sum.week.get(r) ?? 0} · 이번 달 ${sum.month.get(r) ?? 0}`);
+      const recent = sum.recent.map(
+        (v) => `• ${fmtKst(new Date(v.occurred_at))} ${esc(nameOf(v.symbol))} ${RULE_LABEL[v.rule as RuleName] ?? esc(v.rule)} — ${esc(v.detail)}`,
+      );
+      await ctx.reply(`<b>매매 규칙</b>\n${lines.join('\n')}${recent.length ? `\n\n<b>최근 위반</b>\n${recent.join('\n')}` : ''}`, html);
+    });
+
+    bot.command('digest', async (ctx) => {
+      const arg = ctx.match.trim().toLowerCase();
+      if (arg === 'on' || arg === 'off') {
+        d.digest.setEnabled(arg === 'on');
+        return void (await ctx.reply(`장 마감 요약을 ${arg === 'on' ? '켰습니다' : '껐습니다'}.`));
+      }
+      if (arg === 'krx' || arg === 'us' || arg === 'crypto') {
+        await ctx.replyWithChatAction('typing').catch(() => undefined);
+        const reason = await d.digest.run(arg as DigestMarket, true);
+        if (reason) await ctx.reply(`보낼 요약이 없습니다: ${esc(reason)}`, html);
+        return;
+      }
+      const t = d.cfg.digest;
+      await ctx.reply(
+        `장 마감 요약: ${d.digest.enabled() ? '켜짐' : '꺼짐'}\nKRX ${t.krx} · 미국 ${t.us} · 크립토 ${t.crypto} (KST)\n` +
+          '<code>/digest on|off</code>, 지금 받기: <code>/digest krx|us|crypto</code>',
+        html,
+      );
+    });
+
+    bot.command('import_tv', async (ctx) => {
+      let lists;
+      try {
+        lists = await d.md.watchlists();
+      } catch (e) {
+        if (e instanceof MarketDataError && e.code === 'NO_CREDENTIALS') {
+          return void (await ctx.reply('TradingView 쿠키(TV_SESSION, TV_SIGNATURE)를 .env에 넣어야 합니다.'));
+        }
+        return void (await ctx.reply(`watchlist를 가져오지 못했습니다: ${esc((e as Error).message)}`, html));
+      }
+      const nonEmpty = lists.filter((l) => l.symbols.length > 0);
+      if (nonEmpty.length === 0) return void (await ctx.reply('TradingView watchlist가 비어 있습니다.'));
+      await ctx.reply('가져올 watchlist를 고르세요. 이미 있는 종목은 건너뜁니다.', {
+        reply_markup: d.choices.keyboard(
+          ctx.chat.id,
+          nonEmpty.map((l) => ({
+            label: `${l.name} (${l.symbols.length})`.slice(0, 60),
+            run: async (c) => {
+              const added: string[] = [];
+              const failed: string[] = [];
+              const existing = new Set(d.repo.listWatch().map((w) => w.symbol));
+              for (const sym of l.symbols.filter((x) => !existing.has(x))) {
+                try {
+                  const meta = await d.md.symbolInfo(sym);
+                  d.repo.upsertMeta({ symbol: sym, description: meta.description, currency: meta.currency ?? null, timezone: meta.timezone, session: meta.session });
+                  d.monitor.setMeta(meta);
+                  d.repo.addWatch({
+                    symbol: sym,
+                    displayName: d.resolver.displayName(sym) ?? meta.localDescription ?? meta.description,
+                    criteria: resolveCriteria({ sigma: undefined, pct: undefined }),
+                    volumeEnabled: meta.timezone === 'America/New_York' ? d.cfg.defaults.volume_enabled_us : true,
+                  });
+                  added.push(sym);
+                } catch {
+                  failed.push(sym);
+                }
+              }
+              d.subs.request();
+              void d.history.refreshAll(added);
+              await c.reply(
+                `"${esc(l.name)}" 가져오기: 추가 ${added.length} · 이미 있음 ${l.symbols.length - added.length - failed.length}` +
+                  (failed.length ? ` · 실패 ${failed.length} (${failed.map(esc).join(', ')})` : ''),
+                html,
+              );
+            },
+          })),
+        ),
+      });
+    });
+  }
 
   bot.command('status', async (ctx) => {
     const st = d.md.status();

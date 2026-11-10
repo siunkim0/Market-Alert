@@ -1,5 +1,5 @@
 /** Telegram 메시지 포맷 (parse_mode: HTML) */
-import type { WatchRow } from '../db/repo.js';
+import { criteriaOf, type Criteria, type WatchRow } from '../db/repo.js';
 import type { FeedStatus } from '../market/marketData.js';
 import type { Snapshot } from '../market/monitor.js';
 import { fmtKst } from '../time.js';
@@ -31,8 +31,14 @@ export function delayTag(s: Pick<Snapshot, 'delay'>): string {
   return min ? ` [${min}분 지연]` : ' [지연]';
 }
 
-export function thresholdLabel(w: Pick<WatchRow, 'mode' | 'threshold'>): string {
-  return w.mode === 'sigma' ? `${w.threshold}σ` : `${w.threshold}%`;
+export function criteriaLabel(c: Criteria): string {
+  return [c.sigma !== null ? `${c.sigma}σ` : '', c.pct !== null ? `${c.pct}%` : ''].filter(Boolean).join(' · ');
+}
+
+export function thresholdLabel(w: Pick<WatchRow, 'mode' | 'threshold' | 'sigma_threshold' | 'pct_threshold'>): string {
+  return criteriaOf(w)
+    .map((c) => (c.mode === 'sigma' ? `${c.threshold}σ` : `${c.threshold}%`))
+    .join(' · ');
 }
 
 export function formatList(items: { w: WatchRow; s: Snapshot; today?: string | undefined }[], now = new Date()): string {

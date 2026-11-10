@@ -10,11 +10,18 @@ const SymbolQuery = z.string().trim().min(1).max(40);
 export const IntentSchemas = {
   add_watch: z.object({
     symbol_query: SymbolQuery,
-    mode: z.enum(['sigma', 'pct']).optional(),
-    threshold: z.number().positive().max(100).optional(),
+    sigma_threshold: z.number().positive().max(100).optional(),
+    pct_threshold: z.number().positive().max(100).optional(),
   }),
   remove_watch: z.object({ symbol_query: SymbolQuery }),
-  set_mode: z.object({ symbol_query: SymbolQuery, mode: z.enum(['sigma', 'pct']), threshold: z.number().positive().max(100) }),
+  set_mode: z
+    .object({
+      symbol_query: SymbolQuery,
+      mode: z.enum(['sigma', 'pct']),
+      threshold: z.number().positive().max(100).optional(),
+      off: z.boolean().optional(),
+    })
+    .refine((v) => v.off === true || v.threshold !== undefined, { message: 'threshold 또는 off가 필요합니다' }),
   add_level: z.object({
     symbol_query: SymbolQuery,
     price: z.number().positive(),
@@ -58,13 +65,13 @@ function nullableOptionals(t: ToolDef): ToolDef {
 const RAW_TOOLS: ToolDef[] = [
   {
     name: 'add_watch',
-    description: '종목을 watchlist에 추가해 큰 움직임을 감시한다.',
+    description: '종목을 watchlist에 추가해 큰 움직임을 감시한다. σ 기준과 % 기준을 둘 다 말하면 둘 다 넣는다.',
     parameters: {
       type: 'object',
       properties: {
         symbol_query: sym,
-        mode: { type: 'string', enum: ['sigma', 'pct'], description: 'σ(표준편차) 기준이면 sigma, 퍼센트 기준이면 pct' },
-        threshold: { type: 'number', description: '기준값. "4% 움직이면" → 4 (pct), "3시그마" → 3 (sigma)' },
+        sigma_threshold: { type: 'number', description: 'σ(표준편차) 기준. "3시그마" → 3. 말하지 않았으면 생략' },
+        pct_threshold: { type: 'number', description: '퍼센트 기준. "4% 움직이면" → 4. 말하지 않았으면 생략' },
       },
       required: ['symbol_query'],
     },
@@ -76,11 +83,18 @@ const RAW_TOOLS: ToolDef[] = [
   },
   {
     name: 'set_mode',
-    description: '이미 감시 중인 종목의 알림 기준(sigma|pct, 값)을 바꾼다.',
+    description:
+      '이미 감시 중인 종목의 σ 또는 % 기준 하나를 추가·변경하거나 끈다. 다른 기준은 그대로 유지된다. ' +
+      '"삼성전자 5%도 알려줘" → pct 5, "하이닉스 시그마 알림은 꺼줘" → sigma off.',
     parameters: {
       type: 'object',
-      properties: { symbol_query: sym, mode: { type: 'string', enum: ['sigma', 'pct'] }, threshold: { type: 'number' } },
-      required: ['symbol_query', 'mode', 'threshold'],
+      properties: {
+        symbol_query: sym,
+        mode: { type: 'string', enum: ['sigma', 'pct'] },
+        threshold: { type: 'number', description: '새 기준값. 끌 때는 생략' },
+        off: { type: 'boolean', description: '그 기준을 끌 때 true' },
+      },
+      required: ['symbol_query', 'mode'],
     },
   },
   {
@@ -149,7 +163,7 @@ export const TOOLS: ToolDef[] = RAW_TOOLS.map(nullableOptionals);
 const SYSTEM = `너는 Telegram 마켓 알림 봇의 명령 해석기다. 사용자의 한국어/영어 메시지를 도구 하나로 바꾼다.
 - 메시지에 맞는 도구가 있으면 반드시 도구를 호출한다. 종목 이름은 사용자가 쓴 그대로 symbol_query에 넣는다.
 - 한국어 숫자 단위를 풀어서 넣는다: 19만원 → 190000, 1.5만 → 15000, 8만 달러 → 80000.
-- 이미 한 매매를 알려 주면(샀다/팔았다/진입/청산) record_trade. 수량이나 가격이 빠졌으면 도구를 호출하지 말고 무엇이 빠졌는지 한 문장으로 묻는다.
+@@TRADE
 - 앞으로 할 매매("살까?", "사줘")는 기록하지 않는다. 이 봇은 주문을 내지 않는다고 한 문장으로 답한다.
 - 그 밖에 도구가 없는 요청이나 잡담이면 도구를 호출하지 말고 한 문장으로 답한다.
 - 매수·매도 추천이나 투자 조언은 하지 않는다.`;
@@ -159,10 +173,25 @@ export type ParseResult =
   | { kind: 'text'; text: string }
   | { kind: 'invalid'; reason: string };
 
-export async function parseIntent(llm: LlmClient, message: string): Promise<ParseResult> {
-  const r = await llm.tools({ tier: 'fast', system: SYSTEM, user: message, tools: TOOLS });
+const TRADE_ON =
+  '- 이미 한 매매를 알려 주면(샀다/팔았다/진입/청산) record_trade. 수량이나 가격이 빠졌으면 도구를 호출하지 말고 무엇이 빠졌는지 한 문장으로 묻는다.';
+const TRADE_OFF =
+  '- 매매 기록(샀다/팔았다/매수/매도), 손절가·익절가 설정 요청이면 도구를 호출하지 말고 정확히 "매매 기록 기능은 꺼져 있습니다. 기록되지 않았습니다."라고만 답한다.';
+const JOURNAL_TOOLS = new Set(['record_trade', 'set_stop']);
+
+export interface IntentOptions {
+  /** Phase 5 매매 기록 도구 사용 여부 */
+  journal: boolean;
+}
+
+export async function parseIntent(llm: LlmClient, message: string, opts: IntentOptions = { journal: true }): Promise<ParseResult> {
+  const tools = opts.journal ? TOOLS : TOOLS.filter((t) => !JOURNAL_TOOLS.has(t.name));
+  const system = SYSTEM.replace('@@TRADE', opts.journal ? TRADE_ON : TRADE_OFF);
+  const r = await llm.tools({ tier: 'fast', system, user: message, tools });
   if (r.kind === 'text') return { kind: 'text', text: r.text.trim() };
-  if (!(r.name in IntentSchemas)) return { kind: 'invalid', reason: `알 수 없는 도구: ${r.name}` };
+  if (!(r.name in IntentSchemas) || !tools.some((t) => t.name === r.name)) {
+    return { kind: 'invalid', reason: `알 수 없는 도구: ${r.name}` };
+  }
   const name = r.name as IntentName;
   // LLM이 숫자를 문자열로 주는 경우를 흡수
   const args = coerceNumbers(r.args);
@@ -175,7 +204,7 @@ function coerceNumbers(v: unknown): unknown {
   if (!v || typeof v !== 'object') return v;
   const out: Record<string, unknown> = {};
   for (const [k, x] of Object.entries(v as Record<string, unknown>)) {
-    if (['threshold', 'price', 'proximity_pct', 'qty', 'stop_loss', 'take_profit'].includes(k) && typeof x === 'string') {
+    if (['threshold', 'sigma_threshold', 'pct_threshold', 'price', 'proximity_pct', 'qty', 'stop_loss', 'take_profit'].includes(k) && typeof x === 'string') {
       const n = Number(x.replace(/[,%\s]/g, ''));
       out[k] = Number.isFinite(n) ? n : x;
     } else if (x !== null) out[k] = x;

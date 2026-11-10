@@ -1,5 +1,5 @@
 /** 규칙 평가 (순수 함수). 통과한 후보(RuleHit)를 돌려주고, cooldown 판단은 engine이 한다. */
-import type { LevelRow, WatchRow } from '../db/repo.js';
+import { criteriaOf, type LevelRow, type WatchRow } from '../db/repo.js';
 import type { Snapshot } from '../market/monitor.js';
 import { reachedLevel, type EscalationConfig } from './cooldown.js';
 
@@ -49,10 +49,12 @@ export function evaluateWatch(w: WatchRow, s: Snapshot, cfg: RuleConfig): RuleHi
   const hits: RuleHit[] = [];
   if (!s.quote) return hits;
 
-  const value = w.mode === 'sigma' ? s.z : s.r === null ? null : s.r * 100;
-  if (value !== null && value !== 0) {
-    const lv = reachedLevel(w.mode, w.threshold, Math.abs(value), cfg.esc);
-    if (lv) hits.push({ type: w.mode, direction: value > 0 ? 'up' : 'down', level: lv.level, next: lv.next, value });
+  // σ와 % 기준을 각각 평가 (둘 다 켜져 있을 수 있다)
+  for (const c of criteriaOf(w)) {
+    const value = c.mode === 'sigma' ? s.z : s.r === null ? null : s.r * 100;
+    if (value === null || value === 0) continue;
+    const lv = reachedLevel(c.mode, c.threshold, Math.abs(value), cfg.esc);
+    if (lv) hits.push({ type: c.mode, direction: value > 0 ? 'up' : 'down', level: lv.level, next: lv.next, value });
   }
 
   if (

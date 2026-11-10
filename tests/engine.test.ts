@@ -47,7 +47,7 @@ async function setup(repo: Repo, positionOf?: (s: string) => import('../src/trig
     benchmarks: {},
     nameOf: (s) => s,
     positionOf,
-    defaultWatch: { mode: 'sigma', threshold: 3 },
+    defaultWatch: { mode: "sigma", threshold: 3 },
   });
   engine.start();
   engine.stop(); // prune 타이머만 끈다 (listener는 유지)
@@ -68,7 +68,7 @@ describe('TriggerEngine (FakeMarketData 재생)', () => {
 
   it('pct 0.3%: 같은 단계 반복 없음, 다음 단계에서만, 반대 방향 별도, 재시작 후 유지', async () => {
     repo = new Repo(':memory:');
-    repo.addWatch({ symbol: SYM, displayName: 'BTC', mode: 'pct', threshold: 0.3, volumeEnabled: false });
+    repo.addWatch({ symbol: SYM, displayName: 'BTC', criteria: { sigma: null, pct: 0.3 }, volumeEnabled: false });
     const a = await setup(repo);
     a.feed(0.1);
     a.feed(0.31); // 0.3
@@ -88,7 +88,7 @@ describe('TriggerEngine (FakeMarketData 재생)', () => {
 
   it('첫 quote가 이미 넘은 상태면 (시작 시점 기준) 표시, 다음 거래일 리셋', async () => {
     repo = new Repo(':memory:');
-    repo.addWatch({ symbol: SYM, displayName: 'BTC', mode: 'sigma', threshold: 0.5, volumeEnabled: false });
+    repo.addWatch({ symbol: SYM, displayName: 'BTC', criteria: { sigma: 0.5, pct: null }, volumeEnabled: false });
     const a = await setup(repo);
     a.feed(1.0); // z ≈ 0.97 → 0.5σ, 시작 시점
     a.feed(1.6); // z ≈ 1.56 → 1.5σ
@@ -96,9 +96,45 @@ describe('TriggerEngine (FakeMarketData 재생)', () => {
     expect(a.sink.labels()).toEqual(['sigma:up:0.5*', 'sigma:up:1.5', 'sigma:up:0.5*']);
   });
 
+  it('σ와 % 기준을 둘 다 걸면 각각 따로 알린다', async () => {
+    repo = new Repo(':memory:');
+    repo.addWatch({ symbol: SYM, displayName: 'BTC', criteria: { sigma: 0.5, pct: 0.3 }, volumeEnabled: false });
+    const a = await setup(repo);
+    a.feed(0.35); // pct 0.3 (z ≈ 0.34 → σ 아직)
+    a.feed(0.6); // z ≈ 0.58 → σ 0.5, pct 0.6
+    expect(a.sink.labels()).toEqual(['pct:up:0.3*', 'sigma:up:0.5', 'pct:up:0.6']);
+    const w = repo.getWatch(SYM)!;
+    expect(a.engine.todaySteps(w, '2026-11-10')).toBe('▲0.5σ · ▲0.6%'.replace(' · ', ' '));
+  });
+
+  it('기준 변경: 하나만 바꾸고 다른 기준은 유지, 둘 다 끄기는 거부', () => {
+    repo = new Repo(':memory:');
+    repo.addWatch({ symbol: SYM, displayName: 'BTC', criteria: { sigma: 3, pct: null }, volumeEnabled: false });
+    expect(repo.updateCriteria(SYM, { pct: 5 })).toEqual({ sigma: 3, pct: 5 });
+    expect(repo.updateCriteria(SYM, { sigma: null })).toEqual({ sigma: null, pct: 5 });
+    expect(() => repo.updateCriteria(SYM, { pct: null })).toThrow();
+    expect(repo.getWatch(SYM)).toMatchObject({ sigma_threshold: null, pct_threshold: 5, mode: 'pct', threshold: 5 });
+  });
+
+  it('기존 DB 마이그레이션: mode/threshold → sigma_threshold/pct_threshold', async () => {
+    const { mkdtempSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const path = (await import('node:path')).join(mkdtempSync((await import('node:path')).join(tmpdir(), 'fs-')), 'old.db');
+    const Database = (await import('better-sqlite3')).default;
+    const old = new Database(path);
+    old.exec(`CREATE TABLE watchlist (id INTEGER PRIMARY KEY, symbol TEXT NOT NULL UNIQUE, display_name TEXT,
+      mode TEXT NOT NULL DEFAULT 'sigma', threshold REAL NOT NULL, volume_enabled INTEGER NOT NULL DEFAULT 1,
+      muted_until TEXT, created_at TEXT NOT NULL);
+      INSERT INTO watchlist (symbol, mode, threshold, created_at) VALUES ('A:B', 'sigma', 3, 'x'), ('C:D', 'pct', 5, 'x');`);
+    old.close();
+    repo = new Repo(path);
+    expect(repo.getWatch('A:B')).toMatchObject({ sigma_threshold: 3, pct_threshold: null });
+    expect(repo.getWatch('C:D')).toMatchObject({ sigma_threshold: null, pct_threshold: 5 });
+  });
+
   it('음소거 중이면 알리지 않는다', async () => {
     repo = new Repo(':memory:');
-    repo.addWatch({ symbol: SYM, displayName: 'BTC', mode: 'pct', threshold: 0.3, volumeEnabled: false });
+    repo.addWatch({ symbol: SYM, displayName: 'BTC', criteria: { sigma: null, pct: 0.3 }, volumeEnabled: false });
     repo.setMuted(SYM, new Date(Date.now() + 3_600_000).toISOString());
     const a = await setup(repo);
     a.feed(1);

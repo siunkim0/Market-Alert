@@ -46,7 +46,7 @@ describe('MarketMonitor + 일봉 캐시 (FakeMarketData)', () => {
 
   it('watchlist CRUD', () => {
     repo = new Repo(':memory:');
-    const w = { symbol: 'KRX:005930', displayName: '삼성전자', mode: 'sigma' as const, threshold: 3, volumeEnabled: true };
+    const w = { symbol: 'KRX:005930', displayName: '삼성전자', criteria: { sigma: 3, pct: null }, volumeEnabled: true };
     expect(repo.addWatch(w)).toBe('added');
     expect(repo.addWatch(w)).toBe('exists');
     expect(repo.listWatch()).toHaveLength(1);

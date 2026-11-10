@@ -45,6 +45,9 @@ export type Env = z.infer<typeof EnvSchema>;
 const hhmm = z.string().regex(/^\d{2}:\d{2}$/, 'HH:MM 형식이어야 합니다');
 
 export const ConfigSchema = z.object({
+  features: z
+    .object({ journal: z.boolean().default(false), rules_digest: z.boolean().default(false) })
+    .default({ journal: false, rules_digest: false }),
   defaults: z.object({
     mode: z.enum(['sigma', 'pct']).default('sigma'),
     sigma_threshold: z.number().positive().default(3),

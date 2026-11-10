@@ -1,7 +1,7 @@
 import { Bot, GrammyError, HttpError } from 'grammy';
 import type { Logger } from '../logger.js';
 import type { LlmClient } from '../agent/llm.js';
-import { COMMANDS, registerCommands, type BotDeps } from './commands.js';
+import { enabledCommands, registerCommands, type BotDeps } from './commands.js';
 import { registerNaturalLanguage, type PendingStops } from './naturalLanguage.js';
 
 export function createBot(
@@ -28,7 +28,7 @@ export function createBot(
   deps.choices.register(bot);
   const actions = registerCommands(bot, deps);
   // 명령어 핸들러 뒤에 등록해야 명령어가 먼저 처리된다
-  registerNaturalLanguage(bot, { llm, actions, choices: deps.choices, resolver: deps.resolver, pendingStops, logger: deps.logger });
+  registerNaturalLanguage(bot, { llm, actions, choices: deps.choices, resolver: deps.resolver, pendingStops, journalEnabled: deps.cfg.features.journal, logger: deps.logger });
 
   bot.catch((err) => {
     const e = err.error;
@@ -41,8 +41,9 @@ export function createBot(
   return bot;
 }
 
-export async function startBot(bot: Bot, logger: Logger): Promise<void> {
-  await bot.api.setMyCommands(COMMANDS).catch((e: Error) => logger.warn({ err: e.message }, 'setMyCommands 실패'));
+export async function startBot(bot: Bot, logger: Logger, features: { journal: boolean; rules_digest: boolean }): Promise<void> {
+  // 꺼진 기능은 Telegram 명령어 메뉴에서도 뺀다
+  await bot.api.setMyCommands(enabledCommands(features)).catch((e: Error) => logger.warn({ err: e.message }, 'setMyCommands 실패'));
   bot
     .start({
       drop_pending_updates: false,

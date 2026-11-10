@@ -7,7 +7,7 @@ import type { Logger } from '../logger.js';
 import type { MarketMonitor, Snapshot } from '../market/monitor.js';
 import { Cooldown, cooldownKey, type EscalationConfig } from './cooldown.js';
 import { evaluateLevel, evaluatePosition, evaluateWatch, type RuleConfig, type RuleHit } from './rules.js';
-import type { WatchMode } from '../db/repo.js';
+import { criteriaOf, type WatchMode } from '../db/repo.js';
 
 export interface HeldPosition {
   qty: number;
@@ -127,11 +127,13 @@ export class TriggerEngine {
   /** /list용: 오늘 이미 알린 단계 (예: '▲4σ ▼3σ') */
   todaySteps(w: WatchRow, sessionDate: string | undefined): string | undefined {
     if (!sessionDate) return undefined;
-    const unit = w.mode === 'sigma' ? 'σ' : '%';
     const parts: string[] = [];
-    for (const [dir, arrow] of [['up', '▲'], ['down', '▼']] as const) {
-      const v = this.cooldown.get(cooldownKey(w.symbol, w.mode, dir, sessionDate));
-      if (v !== undefined) parts.push(`${arrow}${fmtLevel(v)}${unit}`);
+    for (const c of criteriaOf(w)) {
+      const unit = c.mode === 'sigma' ? 'σ' : '%';
+      for (const [dir, arrow] of [['up', '▲'], ['down', '▼']] as const) {
+        const v = this.cooldown.get(cooldownKey(w.symbol, c.mode, dir, sessionDate));
+        if (v !== undefined) parts.push(`${arrow}${fmtLevel(v)}${unit}`);
+      }
     }
     return parts.length > 0 ? parts.join(' ') : undefined;
   }
@@ -145,7 +147,10 @@ export class TriggerEngine {
       (pos && this.d.defaultWatch
         ? {
             id: -1, symbol: s.symbol, display_name: null, mode: this.d.defaultWatch.mode,
-            threshold: this.d.defaultWatch.threshold, volume_enabled: 0, muted_until: null, created_at: '',
+            threshold: this.d.defaultWatch.threshold,
+            sigma_threshold: this.d.defaultWatch.mode === 'sigma' ? this.d.defaultWatch.threshold : null,
+            pct_threshold: this.d.defaultWatch.mode === 'pct' ? this.d.defaultWatch.threshold : null,
+            volume_enabled: 0, muted_until: null, created_at: '',
           }
         : undefined);
     const levels = this.levels.get(s.symbol) ?? [];

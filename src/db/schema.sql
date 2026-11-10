@@ -2,8 +2,10 @@ CREATE TABLE IF NOT EXISTS watchlist (
   id INTEGER PRIMARY KEY,
   symbol TEXT NOT NULL UNIQUE,         -- 'KRX:005930'
   display_name TEXT,                   -- '삼성전자'
-  mode TEXT NOT NULL DEFAULT 'sigma',  -- 'sigma' | 'pct'
+  mode TEXT NOT NULL DEFAULT 'sigma',  -- (구) 대표 기준. sigma_threshold/pct_threshold가 실제 기준
   threshold REAL NOT NULL,
+  sigma_threshold REAL,                -- σ 기준 (NULL이면 끔)
+  pct_threshold REAL,                  -- % 기준 (NULL이면 끔)
   volume_enabled INTEGER NOT NULL DEFAULT 1,
   muted_until TEXT,
   created_at TEXT NOT NULL

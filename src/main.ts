@@ -49,12 +49,16 @@ async function main(): Promise<void> {
   const resolver = new SymbolResolver(conf.aliases, md);
   const choices = new Choices(logger);
 
+  const features = cfg.features;
+  logger.info({ features }, '기능 스위치');
   const journal = new Journal(repo, logger);
-  // 보유 종목은 watchlist에 없어도 구독
-  subs.addSource(() => journal.openSymbols());
-  journal.onChange(() => subs.request());
+  if (features.journal) {
+    // 보유 종목은 watchlist에 없어도 구독
+    subs.addSource(() => journal.openSymbols());
+    journal.onChange(() => subs.request());
+  }
   const syncer =
-    env.BINANCE_API_KEY && env.BINANCE_API_SECRET
+    features.journal && env.BINANCE_API_KEY && env.BINANCE_API_SECRET
       ? new BinanceFuturesImporter({ apiKey: env.BINANCE_API_KEY, apiSecret: env.BINANCE_API_SECRET }, repo, journal, logger)
       : undefined;
   logger.info({ binance: syncer ? 'on' : 'off' }, 'Binance 동기화');
@@ -83,7 +87,7 @@ async function main(): Promise<void> {
     },
     benchmarks: cfg.benchmarks,
     nameOf: (s) => resolver.displayName(s) ?? repo.getMeta(s)?.description ?? s,
-    positionOf: (s) => journal.position(s),
+    positionOf: features.journal ? (s) => journal.position(s) : undefined,
     defaultWatch: {
       mode: cfg.defaults.mode,
       threshold: cfg.defaults.mode === 'sigma' ? cfg.defaults.sigma_threshold : cfg.defaults.pct_threshold,
@@ -128,7 +132,7 @@ async function main(): Promise<void> {
   // 매매 규칙 체크: 새 체결마다
   const rules = new RulesChecker(repo, journal, cfg.trading_rules, logger);
   const pendingStops = new PendingStops();
-  journal.onRecorded((trades) => {
+  if (features.journal && features.rules_digest) journal.onRecorded((trades) => {
     const warnings = rules.check(trades);
     // 기록 확인 메시지 뒤에 오도록 잠깐 늦춘다
     setTimeout(() => {
@@ -155,14 +159,14 @@ async function main(): Promise<void> {
 
   const digest = new DigestService({
     repo, history, journal, benchmarks: cfg.benchmarks,
-    symbols: () => [...new Set([...repo.listWatch().map((w) => w.symbol), ...journal.openSymbols()])],
+    symbols: () => [...new Set([...repo.listWatch().map((w) => w.symbol), ...(features.journal ? journal.openSymbols() : [])])],
     nameOf,
     send: (html) => broadcast(html),
     logger,
   });
 
   const crons = scheduleDailyBars(cfg.daily_bars_refresh, history, () => subs.desired(), logger);
-  crons.push(...digest.schedule(cfg.digest));
+  if (features.rules_digest) crons.push(...digest.schedule(cfg.digest));
   if (syncer) {
     crons.push(scheduleSync(cfg.journal_sync_minutes, syncer, logger));
     void syncer.sync().catch((e: Error) => logger.warn({ err: e.message }, '첫 Binance 동기화 실패'));
@@ -171,7 +175,7 @@ async function main(): Promise<void> {
   const bot = createBot(env.TELEGRAM_BOT_TOKEN, env.TELEGRAM_ALLOWED_CHAT_IDS, {
     cfg, repo, md, monitor, history, subs, resolver, choices, engine, explainer, journal, syncer, rules, digest, logger,
   }, llm, pendingStops);
-  await startBot(bot, logger);
+  await startBot(bot, logger, features);
 
   let stopping = false;
   const shutdown = async (sig: string) => {

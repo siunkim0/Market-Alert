@@ -1,3 +1,6 @@
+features:                # 기능 스위치 (Phase 1~4는 항상 켜짐)
+  journal: false         # Phase 5: 매매 기록·포지션·손익 (/buy /sell /sl /tp /pos /history /pnl /note /deltrade /export /sync), 보유 종목 감시·손절/익절 알림, 자연어 매매 기록
+  rules_digest: false    # Phase 6: 매매 규칙 체크(/rules), 장 마감 요약(/digest), /import_tv
 defaults:
   mode: sigma            # sigma | pct
   sigma_threshold: 3.0

@@ -29,7 +29,7 @@ describe('digest', () => {
     for (const s of ['KRX:KOSPI', 'KRX:005930']) {
       repo.upsertMeta({ symbol: s, description: s, currency: 'KRW', timezone: 'Asia/Seoul', session: '0900-1535' });
     }
-    repo.addWatch({ symbol: 'KRX:005930', displayName: '삼성전자', mode: 'sigma', threshold: 3, volumeEnabled: true });
+    repo.addWatch({ symbol: 'KRX:005930', displayName: '삼성전자', criteria: { sigma: 3, pct: null }, volumeEnabled: true });
     const sent: string[] = [];
     const svc = new DigestService({
       repo, history: new HistoryService(repo, md, 20, logger), journal: new Journal(repo, logger),

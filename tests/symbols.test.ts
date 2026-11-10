@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseAddArgs } from '../src/bot/commands.js';
+import { parseAddArgs, parseCriteria } from '../src/bot/commands.js';
 import { parseAliases } from '../src/config.js';
 import { SymbolResolver } from '../src/market/symbols.js';
 import { FakeMarketData } from './fakes/fakeMarketData.js';
@@ -48,12 +48,23 @@ describe('종목 해석', () => {
 
 describe('/add 인자', () => {
   it('파싱', () => {
-    expect(parseAddArgs('삼성전자')).toEqual({ query: '삼성전자', mode: undefined, threshold: undefined });
-    expect(parseAddArgs('SK 하이닉스 pct 4')).toEqual({ query: 'SK 하이닉스', mode: 'pct', threshold: 4 });
-    expect(parseAddArgs('AAPL SIGMA 2.5')).toEqual({ query: 'AAPL', mode: 'sigma', threshold: 2.5 });
-    expect(parseAddArgs('AAPL pct')).toEqual({ query: 'AAPL', mode: 'pct', threshold: undefined });
+    expect(parseAddArgs('삼성전자')).toEqual({ query: '삼성전자', sigma: undefined, pct: undefined });
+    expect(parseAddArgs('SK 하이닉스 pct 4')).toEqual({ query: 'SK 하이닉스', sigma: undefined, pct: 4 });
+    expect(parseAddArgs('AAPL SIGMA 2.5')).toEqual({ query: 'AAPL', sigma: 2.5, pct: undefined });
+    expect(parseAddArgs('AAPL pct')).toEqual({ query: 'AAPL', sigma: undefined, pct: null });
+    // 둘 다
+    expect(parseAddArgs('SK 하이닉스 sigma 3 pct 5')).toEqual({ query: 'SK 하이닉스', sigma: 3, pct: 5 });
+    expect(parseAddArgs('AAPL pct 5% sigma')).toEqual({ query: 'AAPL', sigma: null, pct: 5 });
     expect(parseAddArgs('AAPL pct -1')).toHaveProperty('error');
+    expect(parseAddArgs('AAPL pct 4 pct 5')).toHaveProperty('error');
+    expect(parseAddArgs('AAPL sigma off')).toHaveProperty('error');
     expect(parseAddArgs('')).toHaveProperty('error');
+  });
+
+  it('/mode 기준 (off 허용)', () => {
+    expect(parseCriteria('삼성전자 sigma off', true)).toEqual({ rest: '삼성전자', sigma: 'off', pct: undefined });
+    expect(parseCriteria('삼성전자 pct 5 sigma off', true)).toEqual({ rest: '삼성전자', sigma: 'off', pct: 5 });
+    expect(parseCriteria('삼성전자', true)).toEqual({ rest: '삼성전자', sigma: undefined, pct: undefined });
   });
 });
 

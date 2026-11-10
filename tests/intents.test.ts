@@ -10,9 +10,9 @@ const resolver = new SymbolResolver(parseAliases({ 'KRX:000660': { name: 'SK하�
 
 describe('자연어 의도', () => {
   it('tool 호출 → zod 검증 → 확인 문구', async () => {
-    const llm = new FakeLlm({}, { kind: 'tool', name: 'add_watch', args: { symbol_query: '하이닉스', mode: 'pct', threshold: '4' } });
-    const r = await parseIntent(llm, '하이닉스 4% 움직이면 알려줘');
-    expect(r).toEqual({ kind: 'intent', intent: { name: 'add_watch', args: { symbol_query: '하이닉스', mode: 'pct', threshold: 4 } } });
+    const llm = new FakeLlm({}, { kind: 'tool', name: 'add_watch', args: { symbol_query: '하이닉스', pct_threshold: '4', sigma_threshold: 3 } });
+    const r = await parseIntent(llm, '하이닉스 3시그마랑 4% 둘 다 알려줘');
+    expect(r).toEqual({ kind: 'intent', intent: { name: 'add_watch', args: { symbol_query: '하이닉스', pct_threshold: 4, sigma_threshold: 3 } } });
     expect(llm.prompts[0]!.tier).toBe('fast');
     if (r.kind === 'intent') {
       expect(isReadOnly(r.intent)).toBe(false);
@@ -24,6 +24,14 @@ describe('자연어 의도', () => {
     const llm = new FakeLlm({}, { kind: 'tool', name: 'add_level', args: { symbol_query: '삼성전자', price: '190,000', note: null } });
     const r = await parseIntent(llm, '삼성전자 19만원 깨지면 알려줘');
     expect(r).toMatchObject({ kind: 'intent', intent: { name: 'add_level', args: { price: 190000 } } });
+  });
+
+  it('set_mode: 끄기와 값 없는 호출', async () => {
+    const off = await parseIntent(new FakeLlm({}, { kind: 'tool', name: 'set_mode', args: { symbol_query: '하이닉스', mode: 'sigma', off: true, threshold: null } }), 'm');
+    expect(off).toMatchObject({ kind: 'intent', intent: { name: 'set_mode', args: { mode: 'sigma', off: true } } });
+    if (off.kind === 'intent') expect(describeIntent(off.intent, resolver)).toContain('끌까요');
+    const bad = await parseIntent(new FakeLlm({}, { kind: 'tool', name: 'set_mode', args: { symbol_query: 'x', mode: 'pct' } }), 'm');
+    expect(bad.kind).toBe('invalid');
   });
 
   it('잘못된 인자는 invalid, 모르는 도구도 invalid', async () => {

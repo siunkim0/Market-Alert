@@ -6,12 +6,35 @@ import { nowIso } from '../time.js';
 
 export type WatchMode = 'sigma' | 'pct';
 
+/** 종목 알림 기준. null이면 그 기준은 꺼짐. 둘 다 켤 수 있다. */
+export interface Criteria {
+  sigma: number | null;
+  pct: number | null;
+}
+
+/** watchlist 행의 켜진 기준 목록 (σ 먼저) */
+export function criteriaOf(w: Pick<WatchRow, 'mode' | 'threshold' | 'sigma_threshold' | 'pct_threshold'>): { mode: WatchMode; threshold: number }[] {
+  const out: { mode: WatchMode; threshold: number }[] = [];
+  if (w.sigma_threshold !== null && w.sigma_threshold !== undefined) out.push({ mode: 'sigma', threshold: w.sigma_threshold });
+  if (w.pct_threshold !== null && w.pct_threshold !== undefined) out.push({ mode: 'pct', threshold: w.pct_threshold });
+  // 마이그레이션 전 행 대비
+  if (out.length === 0 && w.sigma_threshold === undefined && w.pct_threshold === undefined) out.push({ mode: w.mode, threshold: w.threshold });
+  return out;
+}
+
+function legacy(c: Criteria): { mode: WatchMode; threshold: number } {
+  return c.sigma !== null ? { mode: 'sigma', threshold: c.sigma } : { mode: 'pct', threshold: c.pct ?? 0 };
+}
+
 export interface WatchRow {
   id: number;
   symbol: string;
   display_name: string | null;
+  /** (구) 대표 기준. 실제 기준은 sigma_threshold / pct_threshold (criteriaOf 사용) */
   mode: WatchMode;
   threshold: number;
+  sigma_threshold: number | null;
+  pct_threshold: number | null;
   volume_enabled: number;
   muted_until: string | null;
   created_at: string;
@@ -131,6 +154,15 @@ export class Repo {
   private migrate(): void {
     const cols = (this.db.prepare('PRAGMA table_info(alert_log)').all() as { name: string }[]).map((c) => c.name);
     if (!cols.includes('level_id')) this.db.exec('ALTER TABLE alert_log ADD COLUMN level_id INTEGER');
+    const wcols = (this.db.prepare('PRAGMA table_info(watchlist)').all() as { name: string }[]).map((c) => c.name);
+    if (!wcols.includes('sigma_threshold')) {
+      this.db.exec(`
+        ALTER TABLE watchlist ADD COLUMN sigma_threshold REAL;
+        ALTER TABLE watchlist ADD COLUMN pct_threshold REAL;
+        UPDATE watchlist SET sigma_threshold = threshold WHERE mode = 'sigma';
+        UPDATE watchlist SET pct_threshold = threshold WHERE mode = 'pct';
+      `);
+    }
   }
 
   close(): void {
@@ -138,14 +170,15 @@ export class Repo {
   }
 
   // ── watchlist ──────────────────────────────────────────────
-  addWatch(w: { symbol: string; displayName: string | null; mode: WatchMode; threshold: number; volumeEnabled: boolean }):
-    'added' | 'exists' {
+  addWatch(w: { symbol: string; displayName: string | null; criteria: Criteria; volumeEnabled: boolean }): 'added' | 'exists' {
+    if (w.criteria.sigma === null && w.criteria.pct === null) throw new Error('기준이 하나 이상 있어야 합니다');
+    const l = legacy(w.criteria);
     const r = this.db
       .prepare(
-        `INSERT INTO watchlist (symbol, display_name, mode, threshold, volume_enabled, created_at)
-         VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(symbol) DO NOTHING`,
+        `INSERT INTO watchlist (symbol, display_name, mode, threshold, sigma_threshold, pct_threshold, volume_enabled, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(symbol) DO NOTHING`,
       )
-      .run(w.symbol, w.displayName, w.mode, w.threshold, w.volumeEnabled ? 1 : 0, nowIso());
+      .run(w.symbol, w.displayName, l.mode, l.threshold, w.criteria.sigma, w.criteria.pct, w.volumeEnabled ? 1 : 0, nowIso());
     return r.changes > 0 ? 'added' : 'exists';
   }
 
@@ -161,8 +194,21 @@ export class Repo {
     return this.db.prepare('SELECT * FROM watchlist WHERE symbol = ?').get(symbol) as WatchRow | undefined;
   }
 
-  updateWatchMode(symbol: string, mode: WatchMode, threshold: number): boolean {
-    return this.db.prepare('UPDATE watchlist SET mode = ?, threshold = ? WHERE symbol = ?').run(mode, threshold, symbol).changes > 0;
+  /** 기준 변경. 값이 undefined인 기준은 그대로, null은 끔. 둘 다 꺼지면 에러 */
+  updateCriteria(symbol: string, patch: Partial<Criteria>): Criteria {
+    const w = this.getWatch(symbol);
+    if (!w) throw new Error(`watchlist에 없는 종목: ${symbol}`);
+    const cur = criteriaOf(w);
+    const next: Criteria = {
+      sigma: patch.sigma !== undefined ? patch.sigma : (cur.find((c) => c.mode === 'sigma')?.threshold ?? null),
+      pct: patch.pct !== undefined ? patch.pct : (cur.find((c) => c.mode === 'pct')?.threshold ?? null),
+    };
+    if (next.sigma === null && next.pct === null) throw new Error('σ와 % 기준을 둘 다 끌 수는 없습니다');
+    const l = legacy(next);
+    this.db
+      .prepare('UPDATE watchlist SET sigma_threshold = ?, pct_threshold = ?, mode = ?, threshold = ? WHERE symbol = ?')
+      .run(next.sigma, next.pct, l.mode, l.threshold, symbol);
+    return next;
   }
 
   setMuted(symbol: string, untilIso: string | null): boolean {

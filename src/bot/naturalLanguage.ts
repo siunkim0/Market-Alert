@@ -17,13 +17,20 @@ export function describeIntent(i: Intent, resolver: SymbolResolver): string {
   };
   switch (i.name) {
     case 'add_watch': {
-      const crit = i.args.mode ? ` 기준 ${fmtLevel(i.args.threshold ?? (i.args.mode === 'sigma' ? 3 : 5))}${i.args.mode === 'sigma' ? 'σ' : '%'}` : '';
-      return `${target(i.args.symbol_query)}을 watchlist에 추가할까요?${crit}`;
+      const parts = [
+        i.args.sigma_threshold !== undefined ? `${fmtLevel(i.args.sigma_threshold)}σ` : '',
+        i.args.pct_threshold !== undefined ? `${fmtLevel(i.args.pct_threshold)}%` : '',
+      ].filter(Boolean);
+      return `${target(i.args.symbol_query)}을 watchlist에 추가할까요?${parts.length ? ` 기준 ${parts.join(' · ')}` : ''}`;
     }
     case 'remove_watch':
       return `${target(i.args.symbol_query)}을 watchlist에서 뺄까요?`;
-    case 'set_mode':
-      return `${target(i.args.symbol_query)} 알림 기준을 ${fmtLevel(i.args.threshold)}${i.args.mode === 'sigma' ? 'σ' : '%'}로 바꿀까요?`;
+    case 'set_mode': {
+      const label = i.args.mode === 'sigma' ? 'σ' : '%';
+      return i.args.off
+        ? `${target(i.args.symbol_query)} ${label} 기준 알림을 끌까요? (다른 기준은 유지)`
+        : `${target(i.args.symbol_query)} ${label} 기준을 ${fmtLevel(i.args.threshold!)}${label}로 설정할까요? (다른 기준은 유지)`;
+    }
     case 'add_level':
       return (
         `${target(i.args.symbol_query)} ${fmtPrice(i.args.price)} 레벨 알림을 걸까요?` +
@@ -58,11 +65,15 @@ export function describeIntent(i: Intent, resolver: SymbolResolver): string {
 export function runIntent(i: Intent, ctx: Context, actions: Actions): Promise<void> {
   switch (i.name) {
     case 'add_watch':
-      return actions.add(ctx, { query: i.args.symbol_query, mode: i.args.mode, threshold: i.args.threshold });
+      return actions.add(ctx, { query: i.args.symbol_query, sigma: i.args.sigma_threshold, pct: i.args.pct_threshold });
     case 'remove_watch':
       return actions.remove(ctx, i.args.symbol_query);
     case 'set_mode':
-      return actions.mode(ctx, i.args.symbol_query, i.args.mode, i.args.threshold);
+      return actions.mode(ctx, i.args.symbol_query, {
+        sigma: undefined,
+        pct: undefined,
+        [i.args.mode]: i.args.off ? 'off' : i.args.threshold,
+      });
     case 'add_level':
       return actions.level(ctx, {
         query: i.args.symbol_query,
@@ -116,6 +127,7 @@ export function registerNaturalLanguage(
     choices: Choices;
     resolver: SymbolResolver;
     pendingStops: PendingStops;
+    journalEnabled: boolean;
     logger: Logger;
   },
 ): void {
@@ -147,7 +159,7 @@ export function registerNaturalLanguage(
     await ctx.replyWithChatAction('typing').catch(() => undefined);
     let r;
     try {
-      r = await parseIntent(deps.llm, text);
+      r = await parseIntent(deps.llm, text, { journal: deps.journalEnabled });
     } catch (e) {
       log.warn({ err: (e as Error).message }, '의도 분류 실패');
       await ctx.reply('지금 문장을 해석하지 못했습니다(LLM 오류). /help 의 명령어를 써 주세요.');

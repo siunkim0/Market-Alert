@@ -41,13 +41,18 @@ export function thresholdLabel(w: Pick<WatchRow, 'mode' | 'threshold' | 'sigma_t
     .join(' · ');
 }
 
-export function formatList(items: { w: WatchRow; s: Snapshot; today?: string | undefined }[], now = new Date()): string {
+export function formatList(
+  items: { w: WatchRow; s: Snapshot; today?: string | undefined }[],
+  now = new Date(),
+  ivol?: { timeframe: string; defaultRatio: number },
+): string {
   if (items.length === 0) return 'watchlist가 비어 있습니다. <code>/add 삼성전자</code> 처럼 추가하세요.';
   const lines = items.map(({ w, s, today }) => {
     const name = esc(w.display_name ?? w.symbol);
     const muted = w.muted_until && new Date(w.muted_until) > now ? ` 🔇~${fmtKst(new Date(w.muted_until), now)}` : '';
+    const iv = ivol ? (w.ivol_ratio === 0 ? ` · ${ivol.timeframe}분 거래량 끔` : ` · ${ivol.timeframe}분 거래량 ${w.ivol_ratio ?? ivol.defaultRatio}x`) : '';
     const head =
-      `<b>${name}</b> <code>${esc(w.symbol)}</code> · 기준 ${thresholdLabel(w)}` +
+      `<b>${name}</b> <code>${esc(w.symbol)}</code> · 기준 ${thresholdLabel(w)}${iv}` +
       `${today ? ` · 오늘 ${today}` : ''}${muted}`;
     if (!s.quote) return `${head}\n  시세 대기 중`;
     const sigma = s.sigma !== null ? ` (20일σ ${(s.sigma * 100).toFixed(2)}%)` : ' (σ 계산 불가)';
@@ -79,6 +84,11 @@ export function formatStatus(st: FeedStatus, rows: StatusRow[], now = new Date()
     `구독 ${st.symbols.length}종목 (watchlist ${counts.watch}${extra ? `, ${extra}` : ''})`,
     `마지막 quote ${st.lastQuoteAt ? fmtKst(st.lastQuoteAt, now) : '-'} · 마지막 연결 ${st.lastConnectAt ? fmtKst(st.lastConnectAt, now) : '-'}`,
   ];
+  if (st.bars) {
+    head.push(
+      `<b>${esc(st.bars.timeframe)}분봉</b>: ${st.bars.connected ? '🟢 연결됨' : '🔴 끊김'} · ${st.bars.symbols.length}종목 · 재연결 ${st.bars.reconnects}회`,
+    );
+  }
   if (st.lastError) head.push(`최근 오류: ${esc(st.lastError)}`);
   const order = { watch: 0, level: 1, benchmark: 2 };
   const sorted = [...rows].sort((a, b) => order[a.role] - order[b.role]);
@@ -103,6 +113,14 @@ export function formatStatus(st: FeedStatus, rows: StatusRow[], now = new Date()
 // ── 알림 ─────────────────────────────────────────────────────
 import type { AlertEvent } from '../triggers/engine.js';
 import { fmtLevel } from '../triggers/engine.js';
+
+/** 1,234,567 → 123.5만 / 1.2억 (한국식), 작은 수는 그대로 */
+export function fmtCompact(v: number): string {
+  const a = Math.abs(v);
+  if (a >= 1e8) return `${(v / 1e8).toFixed(1)}억`;
+  if (a >= 1e4) return `${(v / 1e4).toFixed(1)}만`;
+  return v.toLocaleString('en-US', { maximumFractionDigits: a >= 100 ? 0 : 2 });
+}
 
 export function fmtQty(q: number): string {
   return q.toLocaleString('en-US', { maximumFractionDigits: 8 });
@@ -136,6 +154,11 @@ export function formatAlertBlock(ev: AlertEvent, now = new Date()): string {
     tail = `다음 알림: ${sign}${fmtLevel(h.next)}${h.type === 'sigma' ? 'σ' : '%'}`;
   } else if (h.type === 'volume') {
     head = `[거래량 Alert] ${name}  거래량 ${h.value.toFixed(1)}x  ${fmtPct(s.r)} · ${fmtZ(s.z)}`;
+  } else if (h.type === 'ivol') {
+    const end = new Date(h.barStart.getTime() + h.timeframeMin * 60_000);
+    head =
+      `[거래량 급증] ${name}  ${h.timeframeMin}분봉 ${h.ratio.toFixed(1)}x (직전 평균 대비)  ${fmtPct(s.r)} · ${fmtZ(s.z)}`;
+    tail = `봉 ${fmtKst(h.barStart, now)}~${fmtKst(end, now).slice(-5)} KST · 거래량 ${fmtCompact(h.volume)} / 평균 ${fmtCompact(h.avg)} · 기준 ${h.threshold}x`;
   } else if (h.type === 'position') {
     const label = `${h.kind === 'sl' ? '손절' : '익절'} ${h.phase === 'reach' ? '도달' : '근접'}`;
     const what = h.kind === 'sl' ? '손절가' : '익절가';

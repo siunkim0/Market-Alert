@@ -2,6 +2,9 @@
  * TradingView 래퍼. 이 프로젝트에서 @mathieuc/tradingview를 import하는 유일한 파일이다.
  */
 import {
+  TradingViewClient,
+  watchCandles,
+  type CandleWatcher,
   getCandles,
   getQuote,
   getSymbolInfo,
@@ -19,6 +22,7 @@ import {
   MarketDataError,
   type Bar,
   type FeedStatus,
+  type IntradayBar,
   type MarketData,
   type Quote,
   type SymbolCandidate,
@@ -280,7 +284,13 @@ export class TradingViewMarketData implements MarketData {
   }
 
   status(): FeedStatus {
-    return { ...this.st, symbols: [...this.symbols] };
+    return {
+      ...this.st,
+      symbols: [...this.symbols],
+      bars: this.bar.running
+        ? { connected: !!this.bar.client?.isOpen, symbols: [...this.bar.symbols], reconnects: this.bar.reconnects, timeframe: this.bar.timeframe }
+        : undefined,
+    };
   }
 
   async close(): Promise<void> {
@@ -290,6 +300,137 @@ export class TradingViewMarketData implements MarketData {
     clearInterval(this.staleTimer);
     await this.stopWatcher();
     this.st.connected = false;
+    await this.closeBars();
+  }
+
+  // ── 분봉 구독 (연결 하나를 공유, 끊기면 전체 재구성) ─────────
+  private bar = {
+    running: false,
+    client: undefined as TradingViewClient | undefined,
+    watchers: new Map<string, CandleWatcher>(),
+    symbols: [] as string[],
+    timeframe: '15',
+    count: 22,
+    onBars: undefined as ((s: string, b: readonly IntradayBar[]) => void) | undefined,
+    onError: undefined as ((e: MarketDataError) => void) | undefined,
+    gen: 0,
+    backoffMs: BACKOFF_MIN_MS,
+    timer: undefined as NodeJS.Timeout | undefined,
+    reconnects: 0,
+  };
+
+  async watchBars(
+    timeframe: string,
+    count: number,
+    onBars: (symbol: string, bars: readonly IntradayBar[]) => void,
+    onError: (e: MarketDataError) => void,
+  ): Promise<void> {
+    Object.assign(this.bar, { running: true, timeframe, count, onBars, onError });
+    await this.rebuildBars('start');
+  }
+
+  async setBarSymbols(symbols: string[]): Promise<void> {
+    const next = [...new Set(symbols)].sort();
+    if (next.join(',') === [...this.bar.symbols].sort().join(',')) return;
+    const removed = this.bar.symbols.filter((s) => !next.includes(s));
+    const added = next.filter((s) => !this.bar.symbols.includes(s));
+    this.bar.symbols = next;
+    if (!this.bar.running) return;
+    this.log.info({ added, removed }, '분봉 구독 변경');
+    if (!this.bar.client || this.bar.client.isClosed) return void (await this.rebuildBars('symbols-changed'));
+    for (const s of removed) {
+      const w = this.bar.watchers.get(s);
+      this.bar.watchers.delete(s);
+      await w?.stop().catch(() => undefined);
+    }
+    for (const s of added) await this.startBar(s, this.bar.gen);
+  }
+
+  private async closeBars(): Promise<void> {
+    this.bar.running = false;
+    this.bar.gen++;
+    clearTimeout(this.bar.timer);
+    for (const w of this.bar.watchers.values()) await w.stop().catch(() => undefined);
+    this.bar.watchers.clear();
+    this.bar.client?.close();
+    this.bar.client = undefined;
+  }
+
+  private async rebuildBars(reason: string): Promise<void> {
+    if (!this.bar.running) return;
+    clearTimeout(this.bar.timer);
+    this.bar.timer = undefined;
+    const gen = ++this.bar.gen;
+    for (const w of this.bar.watchers.values()) await w.stop().catch(() => undefined);
+    this.bar.watchers.clear();
+    this.bar.client?.close();
+    this.bar.client = undefined;
+    if (this.bar.symbols.length === 0) return;
+
+    const client = new TradingViewClient(this.credentials ? { credentials: this.credentials } : {});
+    this.bar.client = client;
+    client.on('close', () => {
+      if (gen !== this.bar.gen || !this.bar.running) return;
+      this.log.warn('분봉 연결이 닫힘 → 재연결 예약');
+      this.scheduleBarRebuild('closed');
+    });
+    let ok = 0;
+    for (const s of this.bar.symbols) if (await this.startBar(s, gen)) ok++;
+    if (gen !== this.bar.gen) return;
+    if (ok > 0) this.bar.backoffMs = BACKOFF_MIN_MS;
+    this.log.info({ reason, ok, total: this.bar.symbols.length, timeframe: this.bar.timeframe }, '분봉 구독 시작');
+    if (ok === 0) this.scheduleBarRebuild('all-failed');
+  }
+
+  private scheduleBarRebuild(reason: string): void {
+    if (!this.bar.running || this.bar.timer) return;
+    const delay = this.bar.backoffMs;
+    this.bar.backoffMs = Math.min(this.bar.backoffMs * 2, BACKOFF_MAX_MS);
+    this.bar.reconnects++;
+    this.log.warn({ reason, delayMs: delay, reconnects: this.bar.reconnects }, '분봉 재연결 예약');
+    this.bar.timer = setTimeout(() => {
+      this.bar.timer = undefined;
+      void this.rebuildBars(`reconnect:${reason}`);
+    }, delay);
+  }
+
+  private async startBar(symbol: string, gen: number): Promise<boolean> {
+    const client = this.bar.client;
+    if (!client || gen !== this.bar.gen) return false;
+    try {
+      const w = await watchCandles(
+        { symbol, timeframe: this.bar.timeframe, count: this.bar.count, client, timeoutMs: CALL_TIMEOUT_MS },
+        {
+          onData: (candles) => {
+            if (gen !== this.bar.gen) return;
+            this.bar.onBars?.(symbol, candles.map((c) => ({ ...c, volume: sanitizeVolume(c.volume) ?? 0 })));
+          },
+          onError: (e) => {
+            if (gen === this.bar.gen) this.log.warn({ symbol, code: e.code, err: e.message }, '분봉 오류');
+          },
+        },
+      );
+      if (gen !== this.bar.gen || !this.bar.symbols.includes(symbol)) {
+        await w.stop();
+        return false;
+      }
+      this.bar.watchers.set(symbol, w);
+      // 이 종목만 끊긴 경우(연결은 살아 있음) 잠시 뒤 다시 붙인다
+      void w.closed.then(() => {
+        if (this.bar.watchers.get(symbol) !== w || gen !== this.bar.gen || !this.bar.running) return;
+        this.bar.watchers.delete(symbol);
+        if (client.isClosed) return; // 연결 전체 재구성은 close 핸들러가 한다
+        setTimeout(() => {
+          if (gen === this.bar.gen && this.bar.symbols.includes(symbol) && !this.bar.watchers.has(symbol)) void this.startBar(symbol, gen);
+        }, 30_000);
+      });
+      return true;
+    } catch (e) {
+      const err = toMdError(e, symbol);
+      this.log.warn({ symbol, code: err.code, err: err.message }, '분봉 구독 실패');
+      this.bar.onError?.(err);
+      return false;
+    }
   }
 
   // ── 단발 조회 ──────────────────────────────────────────────

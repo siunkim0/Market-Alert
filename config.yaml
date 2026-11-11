@@ -8,6 +8,13 @@ defaults:
   sigma_window: 20       # 거래일
   volume_ratio: 3.0
   volume_enabled_us: true    # quote 거래량 = 일봉 거래량 (전체 시장 기준) 확인됨
+intraday_volume:         # 분봉 거래량 급증 알림 (일봉 거래량 알림보다 빠름)
+  enabled: true
+  timeframe: "15"        # 분봉 (분)
+  lookback: 20           # 직전 완성 봉 개수 (평균 기준)
+  ratio: 2.0             # 지금 봉 거래량 ≥ 평균 × ratio 이면 알림 (종목별 /vol 로 변경)
+  skip_open_bars: 1      # 장 시작 첫 N개 봉 제외 (KRX·미국, 24x7 시장은 해당 없음)
+  skip_close_bars: 1     # 장 마감 직전 N개 봉 제외 (동시호가·MOC)
 escalation:
   sigma_steps: [3, 4, 5, 6]
   pct_step: 2.5          # 5 → 7.5 → 10 ...

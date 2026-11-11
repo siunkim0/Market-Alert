@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS watchlist (
   threshold REAL NOT NULL,
   sigma_threshold REAL,                -- σ 기준 (NULL이면 끔)
   pct_threshold REAL,                  -- % 기준 (NULL이면 끔)
+  ivol_ratio REAL,                     -- 분봉 거래량 배수 (NULL이면 config 기본값, 0이면 끔)
   volume_enabled INTEGER NOT NULL DEFAULT 1,
   muted_until TEXT,
   created_at TEXT NOT NULL

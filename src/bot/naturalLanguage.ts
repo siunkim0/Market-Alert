@@ -37,6 +37,10 @@ export function describeIntent(i: Intent, resolver: SymbolResolver): string {
         (i.args.proximity_pct !== undefined ? ` (근접 ${i.args.proximity_pct}%)` : '') +
         (i.args.note ? ` 메모: ${esc(i.args.note)}` : '')
       );
+    case 'set_volume_alert':
+      return i.args.off
+        ? `${target(i.args.symbol_query)} 분봉 거래량 알림을 끌까요?`
+        : `${target(i.args.symbol_query)} 분봉 거래량이 평균의 ${fmtLevel(i.args.ratio!)}배 이상이면 알릴까요?`;
     case 'mute':
       return i.args.duration === 'off'
         ? `${target(i.args.symbol_query)} 음소거를 해제할까요?`
@@ -81,6 +85,8 @@ export function runIntent(i: Intent, ctx: Context, actions: Actions): Promise<vo
         proximityPct: i.args.proximity_pct,
         note: i.args.note,
       });
+    case 'set_volume_alert':
+      return actions.vol(ctx, i.args.symbol_query, i.args.off ? 0 : i.args.ratio!);
     case 'mute':
       return actions.mute(ctx, i.args.symbol_query, parseDuration(i.args.duration) ?? 0);
     case 'record_trade':

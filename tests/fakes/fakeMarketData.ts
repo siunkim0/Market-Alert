@@ -3,6 +3,7 @@ import {
   MarketDataError,
   type Bar,
   type FeedStatus,
+  type IntradayBar,
   type MarketData,
   type Quote,
   type SymbolCandidate,
@@ -27,6 +28,17 @@ export class FakeMarketData implements MarketData {
   /** 녹화한 quote 재생 */
   replay(quotes: Quote[]): void {
     for (const q of quotes) this.onQuote?.(q);
+  }
+  barSymbols: string[] = [];
+  private onBars: ((s: string, b: readonly IntradayBar[]) => void) | undefined;
+  async watchBars(_tf: string, _n: number, onBars: (s: string, b: readonly IntradayBar[]) => void): Promise<void> {
+    this.onBars = onBars;
+  }
+  async setBarSymbols(symbols: string[]): Promise<void> {
+    this.barSymbols = symbols;
+  }
+  replayBars(symbol: string, bars: IntradayBar[]): void {
+    this.onBars?.(symbol, bars);
   }
   quotes = new Map<string, Quote>();
   async quote(symbol: string): Promise<Quote> {

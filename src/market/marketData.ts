@@ -25,6 +25,16 @@ export interface Bar {
   volume: number;
 }
 
+/** 분봉 (time: 봉 시작 Unix 초) */
+export interface IntradayBar {
+  time: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
+
 export interface SymbolMeta {
   symbol: string;
   description: string;
@@ -51,6 +61,8 @@ export interface TvWatchlist {
 }
 
 export interface FeedStatus {
+  /** 분봉 구독 상태 */
+  bars?: { connected: boolean; symbols: string[]; reconnects: number; timeframe: string };
   connected: boolean;
   symbols: string[];
   reconnects: number;
@@ -74,6 +86,14 @@ export interface MarketData {
   watch(symbols: string[], onQuote: (q: Quote) => void, onError: (e: MarketDataError) => void): Promise<void>;
   /** 구독 목록 교체 */
   setSymbols(symbols: string[]): Promise<void>;
+  /** 분봉 실시간 구독. onBars는 오래된 것부터 count개(마지막은 만들어지는 중인 봉) */
+  watchBars(
+    timeframe: string,
+    count: number,
+    onBars: (symbol: string, bars: readonly IntradayBar[]) => void,
+    onError: (e: MarketDataError) => void,
+  ): Promise<void>;
+  setBarSymbols(symbols: string[]): Promise<void>;
   /** 구독하지 않은 종목의 현재 quote 1회 조회 */
   quote(symbol: string): Promise<Quote>;
   dailyBars(symbol: string, count: number): Promise<Bar[]>;

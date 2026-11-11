@@ -88,6 +88,19 @@ async function main(): Promise<void> {
     benchmarks: cfg.benchmarks,
     nameOf: (s) => resolver.displayName(s) ?? repo.getMeta(s)?.description ?? s,
     positionOf: features.journal ? (s) => journal.position(s) : undefined,
+    intradayVolume: cfg.intraday_volume.enabled
+      ? {
+          timeframeMin: Number(cfg.intraday_volume.timeframe),
+          lookback: cfg.intraday_volume.lookback,
+          skipOpenBars: cfg.intraday_volume.skip_open_bars,
+          skipCloseBars: cfg.intraday_volume.skip_close_bars,
+          defaultRatio: cfg.intraday_volume.ratio,
+        }
+      : undefined,
+    sessionOf: (s) => {
+      const m = repo.getMeta(s);
+      return m?.session && m.timezone ? { session: m.session, timezone: m.timezone } : undefined;
+    },
     defaultWatch: {
       mode: cfg.defaults.mode,
       threshold: cfg.defaults.mode === 'sigma' ? cfg.defaults.sigma_threshold : cfg.defaults.pct_threshold,
@@ -164,6 +177,19 @@ async function main(): Promise<void> {
     send: (html) => broadcast(html),
     logger,
   });
+
+  // 분봉 거래량: watchlist 중 끄지 않은 종목
+  if (cfg.intraday_volume.enabled) {
+    const iv = cfg.intraday_volume;
+    subs.barSymbols = () => repo.listWatch().filter((w) => (w.ivol_ratio ?? iv.ratio) > 0).map((w) => w.symbol);
+    md.setBarSymbols(subs.barSymbols()).catch(() => undefined);
+    await md.watchBars(
+      iv.timeframe,
+      iv.lookback + 2,
+      (symbol, bars) => engine.onBars(symbol, bars),
+      (e) => logger.warn({ code: e.code, symbol: e.symbol, err: e.message }, '분봉 오류'),
+    );
+  }
 
   const crons = scheduleDailyBars(cfg.daily_bars_refresh, history, () => subs.desired(), logger);
   if (features.rules_digest) crons.push(...digest.schedule(cfg.digest));

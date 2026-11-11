@@ -71,7 +71,7 @@ export class Cooldown {
   restore(rows: Pick<AlertLogRow, 'symbol' | 'trigger_type' | 'direction' | 'level_reached' | 'session_date'>[]): number {
     let n = 0;
     for (const r of rows) {
-      if (r.trigger_type === 'level' || r.trigger_type === 'position' || r.level_reached === null || !r.direction) continue;
+      if (r.trigger_type === 'level' || r.trigger_type === 'position' || r.trigger_type === 'ivol' || r.level_reached === null || !r.direction) continue;
       const key = cooldownKey(r.symbol, r.trigger_type, r.direction, r.session_date);
       const prev = this.last.get(key);
       if (prev === undefined || r.level_reached > prev) {

@@ -6,7 +6,11 @@ import type { Repo, LevelRow, NewAlertLog, WatchRow } from '../db/repo.js';
 import type { Logger } from '../logger.js';
 import type { MarketMonitor, Snapshot } from '../market/monitor.js';
 import { Cooldown, cooldownKey, type EscalationConfig } from './cooldown.js';
-import { evaluateLevel, evaluatePosition, evaluateWatch, type RuleConfig, type RuleHit } from './rules.js';
+import {
+  evaluateIntradayVolume, evaluateLevel, evaluatePosition, evaluateWatch,
+  type IntradayVolumeConfig, type RuleConfig, type RuleHit,
+} from './rules.js';
+import { barPosition, type SessionSpec } from '../market/sessions.js';
 import { criteriaOf, type WatchMode } from '../db/repo.js';
 
 export interface HeldPosition {
@@ -59,7 +63,15 @@ export interface EngineDeps {
   /** 보유 포지션 (journal). 보유 종목은 watchlist에 없어도 기본 기준으로 감시한다 */
   positionOf?: (symbol: string) => HeldPosition | undefined;
   defaultWatch?: { mode: WatchMode; threshold: number };
+  /** 분봉 거래량 알림 (없으면 끔) */
+  intradayVolume?: IntradayVolumeConfig & { defaultRatio: number };
+  /** 종목 세션 (분봉 위치 판단용) */
+  sessionOf?: (symbol: string) => SessionSpec | undefined;
   now?: () => Date;
+}
+
+function ivolKey(symbol: string, barTime: number): string {
+  return cooldownKey(symbol, 'ivol', 'up', `bar:${barTime}`);
 }
 
 function positionKey(symbol: string, kind: string, phase: string, groupId: string, target: number): string {
@@ -93,6 +105,9 @@ export class TriggerEngine {
       if (r.trigger_type !== 'position' || !r.direction || r.level_reached === null || r.level_id === null) continue;
       const [kind, phase] = r.direction.split('_');
       if (this.cooldown.tryFire(positionKey(r.symbol, kind!, phase!, `G${r.level_id}`, r.level_reached), 1)) n++;
+    }
+    for (const r of rows) {
+      if (r.trigger_type === 'ivol' && r.level_id !== null && this.cooldown.tryFire(ivolKey(r.symbol, r.level_id), 1)) n++;
     }
     this.log.info({ restored: n }, 'cooldown 단계 복원');
     this.reloadLevels();
@@ -150,7 +165,7 @@ export class TriggerEngine {
             threshold: this.d.defaultWatch.threshold,
             sigma_threshold: this.d.defaultWatch.mode === 'sigma' ? this.d.defaultWatch.threshold : null,
             pct_threshold: this.d.defaultWatch.mode === 'pct' ? this.d.defaultWatch.threshold : null,
-            volume_enabled: 0, muted_until: null, created_at: '',
+            volume_enabled: 0, ivol_ratio: 0, muted_until: null, created_at: '',
           }
         : undefined);
     const levels = this.levels.get(s.symbol) ?? [];
@@ -168,7 +183,7 @@ export class TriggerEngine {
 
     if (w) {
       for (const hit of evaluateWatch(w, s, this.d.rules)) {
-        if (hit.type === 'level' || hit.type === 'position') continue;
+        if (hit.type === 'level' || hit.type === 'position' || hit.type === 'ivol') continue;
         const key = cooldownKey(s.symbol, hit.type, hit.direction, s.sessionDate);
         if (this.cooldown.tryFire(key, hit.level)) fired.push(hit);
       }
@@ -200,13 +215,40 @@ export class TriggerEngine {
       }
     }
 
-    if (fired.length === 0) return;
+    this.emit(s, w?.display_name ?? null, fired, startup, pos);
+  }
 
+  /** 분봉 업데이트 → 거래량 급증 평가 */
+  onBars(symbol: string, bars: readonly { time: number; volume: number }[]): void {
+    const iv = this.d.intradayVolume;
+    if (!iv) return;
+    const w = this.d.repo.getWatch(symbol);
+    if (!w) return;
+    const ratio = w.ivol_ratio ?? iv.defaultRatio;
+    if (!(ratio > 0)) return;
+    const now = this.now();
+    if (w.muted_until && new Date(w.muted_until) > now) return;
+    const s = this.d.monitor.snapshot(symbol, now);
+    if (!s.quote || !s.sessionDate || !s.marketOpen) return;
+    const cur = bars.at(-1);
+    const spec = this.d.sessionOf?.(symbol);
+    if (!cur || !spec) return;
+    const hit = evaluateIntradayVolume(
+      bars, ratio, now.getTime(), s.delay.delaySec ?? 0, iv,
+      barPosition(spec, new Date(cur.time * 1000), iv.timeframeMin),
+    );
+    if (!hit || !this.cooldown.tryFire(ivolKey(symbol, cur.time), 1)) return;
+    this.emit(s, w.display_name, [hit], false, this.d.positionOf?.(symbol));
+  }
+
+  private emit(s: Snapshot, displayName: string | null, fired: RuleHit[], startup: boolean, pos: HeldPosition | undefined): void {
+    if (fired.length === 0) return;
+    const q = s.quote!;
     const bench = this.benchmarkFor(s);
     const events: AlertEvent[] = fired.map((hit) => ({
       alertId: this.d.repo.insertAlert(this.toLog(s, hit)),
       symbol: s.symbol,
-      displayName: w?.display_name ?? this.d.nameOf(s.symbol),
+      displayName: displayName ?? this.d.nameOf(s.symbol),
       hit,
       snapshot: s,
       startup,
@@ -243,6 +285,10 @@ export class TriggerEngine {
     if (hit.type === 'level') {
       return { ...base, direction: hit.phase, level_reached: hit.level.price, level_id: hit.level.id };
     }
+    if (hit.type === 'ivol') {
+      // level_id에 봉 시작 시각(Unix 초)을 넣어 재시작 시 같은 봉 중복을 막는다
+      return { ...base, direction: 'up', level_reached: hit.threshold, volume_ratio: hit.ratio, level_id: Math.floor(hit.barStart.getTime() / 1000) };
+    }
     if (hit.type === 'position') {
       // level_id에 거래 그룹 번호(G<id>의 id)를 넣어 재시작 시 복원한다
       return { ...base, direction: `${hit.kind}_${hit.phase}`, level_reached: hit.target, level_id: Number(hit.groupId.slice(1)) };
@@ -254,6 +300,7 @@ export class TriggerEngine {
 export function hitLabel(h: RuleHit): string {
   if (h.type === 'level') return `level:${h.phase}`;
   if (h.type === 'position') return `position:${h.kind}_${h.phase}`;
+  if (h.type === 'ivol') return `ivol:${h.timeframeMin}m:${h.ratio.toFixed(1)}x`;
   return `${h.type}:${h.direction}:${h.level}`;
 }
 

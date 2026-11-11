@@ -6,6 +6,8 @@ import type { MarketData } from './marketData.js';
 export class SubscriptionManager {
   private timer: NodeJS.Timeout | undefined;
   private readonly extraSources: (() => string[])[] = [];
+  /** 분봉 구독 대상 (없으면 분봉 구독 안 함) */
+  barSymbols: (() => string[]) | undefined;
 
   constructor(
     private readonly repo: Repo,
@@ -30,6 +32,9 @@ export class SubscriptionManager {
     clearTimeout(this.timer);
     this.timer = setTimeout(() => {
       this.md.setSymbols(this.desired()).catch((e: Error) => this.logger.error({ err: e.message }, '구독 갱신 실패'));
+      if (this.barSymbols) {
+        this.md.setBarSymbols(this.barSymbols()).catch((e: Error) => this.logger.error({ err: e.message }, '분봉 구독 갱신 실패'));
+      }
     }, this.debounceMs);
   }
 

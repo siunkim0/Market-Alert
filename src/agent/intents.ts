@@ -28,6 +28,9 @@ export const IntentSchemas = {
     proximity_pct: z.number().min(0).max(50).optional(),
     note: z.string().max(100).optional(),
   }),
+  set_volume_alert: z
+    .object({ symbol_query: SymbolQuery, ratio: z.number().min(1).max(100).optional(), off: z.boolean().optional() })
+    .refine((v) => v.off === true || v.ratio !== undefined, { message: 'ratio 또는 off가 필요합니다' }),
   mute: z.object({ symbol_query: SymbolQuery, duration: z.string().regex(/^(\d+(\.\d+)?(m|h|d)|off)$/) }),
   why: z.object({ symbol_query: SymbolQuery }),
   record_trade: z.object({
@@ -109,6 +112,20 @@ const RAW_TOOLS: ToolDef[] = [
         note: { type: 'string', description: '메모 (예: "ELS 배리어"). 없으면 생략' },
       },
       required: ['symbol_query', 'price'],
+    },
+  },
+  {
+    name: 'set_volume_alert',
+    description:
+      '분봉(기본 15분) 거래량 급증 알림 배수를 정하거나 끈다. "하이닉스 거래량 3배 터지면 알려줘" → ratio 3, "삼성전자 거래량 알림 꺼줘" → off.',
+    parameters: {
+      type: 'object',
+      properties: {
+        symbol_query: sym,
+        ratio: { type: 'number', description: '직전 평균 대비 배수 (예: 3)' },
+        off: { type: 'boolean', description: '끌 때 true' },
+      },
+      required: ['symbol_query'],
     },
   },
   {
@@ -204,7 +221,7 @@ function coerceNumbers(v: unknown): unknown {
   if (!v || typeof v !== 'object') return v;
   const out: Record<string, unknown> = {};
   for (const [k, x] of Object.entries(v as Record<string, unknown>)) {
-    if (['threshold', 'sigma_threshold', 'pct_threshold', 'price', 'proximity_pct', 'qty', 'stop_loss', 'take_profit'].includes(k) && typeof x === 'string') {
+    if (['ratio', 'threshold', 'sigma_threshold', 'pct_threshold', 'price', 'proximity_pct', 'qty', 'stop_loss', 'take_profit'].includes(k) && typeof x === 'string') {
       const n = Number(x.replace(/[,%\s]/g, ''));
       out[k] = Number.isFinite(n) ? n : x;
     } else if (x !== null) out[k] = x;

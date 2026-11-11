@@ -56,6 +56,16 @@ export const ConfigSchema = z.object({
     volume_ratio: z.number().positive().default(3),
     volume_enabled_us: z.boolean().default(true),
   }),
+  intraday_volume: z
+    .object({
+      enabled: z.boolean().default(true),
+      timeframe: z.string().regex(/^\d+$/, '분 단위 숫자 (예: "15")').default('15'),
+      lookback: z.number().int().min(3).max(200).default(20),
+      ratio: z.number().positive().default(2),
+      skip_open_bars: z.number().int().min(0).default(1),
+      skip_close_bars: z.number().int().min(0).default(1),
+    })
+    .default({ enabled: true, timeframe: '15', lookback: 20, ratio: 2, skip_open_bars: 1, skip_close_bars: 1 }),
   escalation: z.object({
     sigma_steps: z.array(z.number().positive()).min(1),
     pct_step: z.number().positive(),

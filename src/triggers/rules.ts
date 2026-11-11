@@ -8,6 +8,16 @@ export type Direction = 'up' | 'down';
 export type RuleHit =
   | { type: 'sigma' | 'pct'; direction: Direction; level: number; next: number; value: number }
   | { type: 'volume'; direction: 'up'; level: number; value: number }
+  | {
+      /** 분봉 거래량 급증 */
+      type: 'ivol';
+      ratio: number;
+      threshold: number;
+      volume: number;
+      avg: number;
+      barStart: Date;
+      timeframeMin: number;
+    }
   | { type: 'level'; phase: 'near' | 'reach'; level: LevelRow; distancePct: number }
   | { type: 'position'; kind: 'sl' | 'tp'; phase: 'near' | 'reach'; target: number; distancePct: number; groupId: string };
 
@@ -78,4 +88,44 @@ export function evaluateLevel(l: LevelRow, price: number, defaultProximityPct: n
   const prox = l.proximity_pct ?? defaultProximityPct;
   if (prox > 0 && Math.abs(distancePct) <= prox) return { type: 'level', phase: 'near', level: l, distancePct };
   return undefined;
+}
+
+export interface IntradayVolumeConfig {
+  timeframeMin: number;
+  lookback: number;
+  skipOpenBars: number;
+  skipCloseBars: number;
+}
+
+/**
+ * 분봉 거래량 급증. bars는 오래된 것부터, 마지막이 만들어지는 중인 봉.
+ * - 마지막 봉이 '지금' 봉이어야 한다 (지연 종목은 now - delay 기준). 장 마감 뒤 멈춘 봉은 평가하지 않음
+ * - 직전 lookback개 완성 봉 평균 대비 배수가 ratio 이상이면 hit
+ * - 장 시작·마감 근처 봉은 제외 (position은 sessions.barPosition 결과)
+ */
+export function evaluateIntradayVolume(
+  bars: readonly { time: number; volume: number }[],
+  ratio: number,
+  nowMs: number,
+  delaySec: number,
+  cfg: IntradayVolumeConfig,
+  position: { openIndex: number; closeIndex: number } | undefined,
+): RuleHit | undefined {
+  if (!(ratio > 0) || bars.length < cfg.lookback + 1) return undefined;
+  const cur = bars[bars.length - 1]!;
+  const tfSec = cfg.timeframeMin * 60;
+  const effNow = nowMs / 1000 - delaySec;
+  // 지금 만들어지는 봉인지 (1분 여유)
+  if (effNow < cur.time - 60 || effNow >= cur.time + tfSec + 60) return undefined;
+  if (!position) return undefined; // 장 밖 봉
+  if (position.openIndex < cfg.skipOpenBars || position.closeIndex < cfg.skipCloseBars) return undefined;
+  const prev = bars.slice(-(cfg.lookback + 1), -1);
+  const avg = prev.reduce((a, b) => a + b.volume, 0) / prev.length;
+  if (!(avg > 0)) return undefined;
+  const r = cur.volume / avg;
+  if (r < ratio) return undefined;
+  return {
+    type: 'ivol', ratio: r, threshold: ratio, volume: cur.volume, avg,
+    barStart: new Date(cur.time * 1000), timeframeMin: cfg.timeframeMin,
+  };
 }

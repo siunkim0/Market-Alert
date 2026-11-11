@@ -35,6 +35,8 @@ export interface WatchRow {
   threshold: number;
   sigma_threshold: number | null;
   pct_threshold: number | null;
+  /** 분봉 거래량 배수. null이면 config 기본값, 0이면 끔 */
+  ivol_ratio: number | null;
   volume_enabled: number;
   muted_until: string | null;
   created_at: string;
@@ -64,7 +66,7 @@ export interface LevelRow {
   created_at: string;
 }
 
-export type TriggerType = 'sigma' | 'pct' | 'volume' | 'level' | 'position';
+export type TriggerType = 'sigma' | 'pct' | 'volume' | 'ivol' | 'level' | 'position';
 
 export interface AlertLogRow {
   id: number;
@@ -163,6 +165,7 @@ export class Repo {
         UPDATE watchlist SET pct_threshold = threshold WHERE mode = 'pct';
       `);
     }
+    if (!wcols.includes('ivol_ratio')) this.db.exec('ALTER TABLE watchlist ADD COLUMN ivol_ratio REAL');
   }
 
   close(): void {
@@ -209,6 +212,11 @@ export class Repo {
       .prepare('UPDATE watchlist SET sigma_threshold = ?, pct_threshold = ?, mode = ?, threshold = ? WHERE symbol = ?')
       .run(next.sigma, next.pct, l.mode, l.threshold, symbol);
     return next;
+  }
+
+  /** 분봉 거래량 배수. null이면 기본값, 0이면 끔 */
+  setIvolRatio(symbol: string, ratio: number | null): boolean {
+    return this.db.prepare('UPDATE watchlist SET ivol_ratio = ? WHERE symbol = ?').run(ratio, symbol).changes > 0;
   }
 
   setMuted(symbol: string, untilIso: string | null): boolean {

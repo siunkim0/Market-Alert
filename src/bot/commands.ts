@@ -35,6 +35,8 @@ export interface Actions {
   level(ctx: Context, args: LevelArgs): Promise<void>;
   /** ms=0이면 해제 */
   mute(ctx: Context, query: string, ms: number): Promise<void>;
+  /** 분봉 거래량 배수. null=기본값, 0=끄기 */
+  vol(ctx: Context, query: string, ratio: number | null): Promise<void>;
   why(ctx: Context, query: string): Promise<void>;
   trade(ctx: Context, side: 'buy' | 'sell', args: TradeArgs): Promise<void>;
   stop(ctx: Context, query: string, kind: 'sl' | 'tp', price: number): Promise<void>;
@@ -77,6 +79,7 @@ export const COMMANDS: { command: string; description: string }[] = [
   { command: 'unlevel', description: '레벨 알림 삭제: /unlevel <id>' },
   { command: 'mute', description: '음소거: /mute <종목> <2h|30m|1d|off>' },
   { command: 'why', description: '지금 움직임의 원인 요약: /why <종목>' },
+  { command: 'vol', description: '분봉 거래량 알림 배수: /vol <종목> <배수|off|default>' },
   { command: 'buy', description: '매수 기록: /buy <종목> <수량> <가격> [sl=] [tp=] [메모]' },
   { command: 'sell', description: '매도 기록: /sell <종목> <수량> <가격> [메모]' },
   { command: 'sl', description: '손절가: /sl <종목> <가격>' },
@@ -107,6 +110,7 @@ const HELP_LINES = [
   '<code>/levels</code>, <code>/unlevel &lt;id&gt;</code> — 레벨 알림 목록·삭제',
   '<code>/mute &lt;종목&gt; &lt;2h|30m|1d|off&gt;</code> — 일시 음소거',
   '<code>/why &lt;종목&gt;</code> — 지금 움직임의 원인 요약 (뉴스 + AI)',
+  '<code>/vol &lt;종목&gt; &lt;배수|off|default&gt;</code> — 15분봉 거래량 급증 알림 (직전 20봉 평균 대비, 기본 2배)',
   '@@P5',
   '<b>매매 기록</b>',
   '<code>/buy &lt;종목&gt; &lt;수량&gt; &lt;가격&gt; [sl=가격] [tp=가격] [fee=수수료] [메모]</code>, <code>/sell …</code>',
@@ -450,7 +454,8 @@ export function registerCommands(bot: Bot, d: BotDeps): Actions {
         const snap = d.monitor.snapshot(w.symbol);
         return { w, s: snap, today: d.engine.todaySteps(w, snap.sessionDate) };
       });
-      await ctx.reply(formatList(items), html);
+      const iv = d.cfg.intraday_volume;
+      await ctx.reply(formatList(items, new Date(), iv.enabled ? { timeframe: iv.timeframe, defaultRatio: iv.ratio } : undefined), html);
     },
 
     async mode(ctx, q, spec) {
@@ -493,6 +498,22 @@ export function registerCommands(bot: Bot, d: BotDeps): Actions {
     },
 
     why: (ctx, q) => resolveOrAsk(ctx, q, (c, sym, name) => why(c, sym, name)),
+
+    async vol(ctx, q, ratio) {
+      const iv = d.cfg.intraday_volume;
+      if (!iv.enabled) return void (await ctx.reply('분봉 거래량 알림이 꺼져 있습니다 (config.yaml intraday_volume.enabled).'));
+      const w = findWatch(q);
+      if (!w) return void (await ctx.reply(`watchlist에 없는 종목입니다: ${esc(q)}`, html));
+      d.repo.setIvolRatio(w.symbol, ratio);
+      d.subs.request();
+      const name = `<b>${esc(w.display_name ?? w.symbol)}</b>`;
+      if (ratio === 0) return void (await ctx.reply(`${name} ${iv.timeframe}분봉 거래량 알림을 껐습니다.`, html));
+      await ctx.reply(
+        `${name} ${iv.timeframe}분봉 거래량이 직전 ${iv.lookback}봉 평균의 ${ratio ?? iv.ratio}배 이상이면 알립니다` +
+          `${ratio === null ? ' (기본값)' : ''}.`,
+        html,
+      );
+    },
 
     trade: (ctx, side, a) => {
       // 보유 종목이면 그 종목으로 (매도 시 검색 생략)
@@ -649,6 +670,25 @@ export function registerCommands(bot: Bot, d: BotDeps): Actions {
     const ms = parseDuration(tokens.at(-1)!);
     if (ms === undefined) return void (await ctx.reply(usage, html));
     await actions.mute(ctx, tokens.slice(0, -1).join(' '), ms);
+  });
+
+  bot.command('vol', async (ctx) => {
+    const tokens = ctx.match.trim().split(/\s+/).filter(Boolean);
+    const iv = d.cfg.intraday_volume;
+    const usage =
+      `형식: <code>/vol &lt;종목&gt; &lt;배수|off|default&gt;</code> — ${iv.timeframe}분봉 거래량이 직전 ${iv.lookback}봉 평균의 N배 이상이면 알림` +
+      ` (기본 ${iv.ratio}배)`;
+    if (tokens.length < 2) return void (await ctx.reply(usage, html));
+    const last = tokens.at(-1)!.toLowerCase().replace(/x$/, '');
+    let ratio: number | null;
+    if (/^(off|끄기|0)$/.test(last)) ratio = 0;
+    else if (/^(default|기본|on)$/.test(last)) ratio = null;
+    else {
+      const r = z.coerce.number().min(1).max(100).safeParse(last);
+      if (!r.success) return void (await ctx.reply(usage, html));
+      ratio = r.data;
+    }
+    await actions.vol(ctx, tokens.slice(0, -1).join(' '), ratio);
   });
 
   bot.command('why', async (ctx) => {

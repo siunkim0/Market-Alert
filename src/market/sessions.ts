@@ -84,3 +84,22 @@ export function marketOf(symbol: string, timezone: string | undefined): MarketKe
   if (timezone === 'America/New_York' || ['NASDAQ', 'NYSE', 'AMEX', 'BATS', 'CBOE'].includes(exch)) return 'US';
   return 'OTHER';
 }
+
+/**
+ * 분봉이 정규장의 시작·마감 몇 번째 봉인지. 장 밖이면 undefined.
+ * openIndex 0 = 장 시작 첫 봉, closeIndex 0 = 마감 직전 마지막 봉. 24x7은 둘 다 Infinity.
+ */
+export function barPosition(spec: SessionSpec, barStart: Date, tfMin: number): { openIndex: number; closeIndex: number } | undefined {
+  const ranges = parseSession(spec.session);
+  if (ranges === 'always') return { openIndex: Infinity, closeIndex: Infinity };
+  const { weekday, minutes } = localClock(barStart, spec.timezone);
+  for (const r of ranges) {
+    if (r.start < r.end && r.days.has(weekday) && minutes >= r.start && minutes < r.end) {
+      return {
+        openIndex: Math.floor((minutes - r.start) / tfMin),
+        closeIndex: Math.floor((r.end - 1 - minutes) / tfMin),
+      };
+    }
+  }
+  return undefined;
+}
